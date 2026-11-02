@@ -1,0 +1,181 @@
+name: Subdomain Fuzz
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target root domain (e.g. example.com)'
+        required: true
+        type: string
+      mode:
+        description: 'Scan mode'
+        required: true
+        type: choice
+        default: 'active'
+        options:
+          - passive
+          - active
+          - full
+      depth:
+        description: 'Recursion depth (0 = off, only used when mode=full)'
+        required: true
+        type: choice
+        default: '0'
+        options:
+          - '0'
+          - '1'
+          - '2'
+          - '3'
+      threads:
+        description: 'Threads (default 20)'
+        required: false
+        type: string
+        default: '20'
+      rate:
+        description: 'Rate limit req/s (default 20)'
+        required: false
+        type: string
+        default: '20'
+
+concurrency:
+  # One run per target at a time — prevents accidental flood
+  group: subfuzz-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  enumerate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350        # hard cap under the 6h runner limit
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ---------- tool install ----------
+      - name: Install massdns
+        run: |
+          git clone --depth 1 https://github.com/blechschmidt/massdns.git /tmp/massdns
+          cd /tmp/massdns
+          make -j
+          sudo make install
+          massdns --version
+
+      - name: Install Go tools
+        run: |
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install github.com/tomnomnom/assetfinder@latest
+          go install github.com/d3mondev/puredns/v2@latest
+          go install github.com/Josue87/gotator@latest
+          # amass is optional — don't fail if install is slow/broken
+          go install github.com/owasp-amass/amass/v4/...@master || echo "amass install failed (optional)"
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+
+      - name: Install dnsgen
+        run: pip install --quiet dnsgen
+
+      # ---------- wordlists + resolvers ----------
+      - name: Download wordlists
+        run: |
+          mkdir -p wordlists
+          curl -fsSL https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-5000.txt -o wordlists/subdomains.txt
+          curl -fsSL https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/permutations.txt            -o wordlists/permutations.txt
+          wc -l wordlists/subdomains.txt wordlists/permutations.txt
+
+      - name: Initialize resolvers
+        run: |
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          if ! puredns init; then
+            echo "puredns init failed — falling back to trickest/resolvers"
+            curl -fsSL https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt -o resolvers.txt
+          fi
+          test -s resolvers.txt
+          echo "resolvers.txt lines: $(wc -l < resolvers.txt)"
+
+      # ---------- run ----------
+      - name: Make script executable
+        run: chmod +x subfuzz.sh
+
+      - name: Run enumeration
+        env:
+          TARGET:  ${{ inputs.target }}
+          MODE:    ${{ inputs.mode }}
+          DEPTH:   ${{ inputs.depth }}
+          THREADS: ${{ inputs.threads }}
+          RATE:    ${{ inputs.rate }}
+        run: |
+          set -euo pipefail
+
+          # basic sanity check on the domain input
+          [[ "$TARGET" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]] || { echo "invalid domain: $TARGET"; exit 1; }
+
+          ARGS=(
+            -d "$TARGET"
+            -w wordlists/subdomains.txt
+            -r resolvers.txt
+            -t "$THREADS"
+            -R "$RATE"
+          )
+
+          if [ "$MODE" = "passive" ]; then
+            ARGS+=(--mode passive)
+          elif [ "$MODE" = "full" ] && [ "$DEPTH" != "0" ]; then
+            ARGS+=(--mode full --depth "$DEPTH" --perm wordlists/permutations.txt)
+          fi
+
+          echo "▶ ./subfuzz.sh ${ARGS[*]}"
+          ./subfuzz.sh "${ARGS[@]}"
+
+      # ---------- outputs ----------
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: subfuzz-${{ inputs.target }}-${{ github.run_id }}
+          path: subenum_out/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Write summary
+        if: always()
+        run: |
+          {
+            echo "## Subdomain Fuzz — \`${{ inputs.target }}\`"
+            echo ""
+            echo "| Setting | Value |"
+            echo "|---|---|"
+            echo "| Mode | \`${{ inputs.mode }}\` |"
+            echo "| Depth | \`${{ inputs.depth }}\` |"
+            echo "| Threads | \`${{ inputs.threads }}\` |"
+            echo "| Rate | \`${{ inputs.rate }}\` req/s |"
+            echo ""
+
+            if [ -f subenum_out/live_hosts.txt ]; then
+              echo "### ✅ Live hosts ($(wc -l < subenum_out/live_hosts.txt))"
+              echo '```'
+              head -50 subenum_out/live_hosts.txt
+              echo '```'
+            fi
+
+            if [ -f subenum_out/resolved_subs.txt ]; then
+              echo "### 🔎 Resolved subdomains ($(wc -l < subenum_out/resolved_subs.txt))"
+              echo '```'
+              head -50 subenum_out/resolved_subs.txt
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
