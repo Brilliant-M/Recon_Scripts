@@ -21,11 +21,7 @@ on:
         required: true
         type: choice
         default: '0'
-        options:
-          - '0'
-          - '1'
-          - '2'
-          - '3'
+        options: ['0', '1', '2', '3']
       threads:
         description: 'Threads (default 20)'
         required: false
@@ -38,20 +34,27 @@ on:
         default: '20'
 
 concurrency:
-  # One run per target at a time — prevents accidental flood
   group: subfuzz-${{ inputs.target }}
   cancel-in-progress: false
 
 jobs:
   enumerate:
     runs-on: ubuntu-latest
-    timeout-minutes: 350        # hard cap under the 6h runner limit
+    timeout-minutes: 350
     permissions:
       contents: read
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Verify scripts exist
+        run: |
+          test -f subfuzz.sh               || { echo "❌ subfuzz.sh missing"; exit 1; }
+          test -f .github/scripts/telegram.sh || { echo "❌ telegram.sh missing"; exit 1; }
+          echo "✅ scripts present"
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -64,7 +67,6 @@ jobs:
         with:
           python-version: '3.11'
 
-      # ---------- tool install ----------
       - name: Install massdns
         run: |
           git clone --depth 1 https://github.com/blechschmidt/massdns.git /tmp/massdns
@@ -82,30 +84,21 @@ jobs:
           go install github.com/tomnomnom/assetfinder@latest
           go install github.com/d3mondev/puredns/v2@latest
           go install github.com/Josue87/gotator@latest
-          # amass is optional — don't fail if install is slow/broken
           go install github.com/owasp-amass/amass/v4/...@master || echo "amass install failed (optional)"
           echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
       - name: Install dnsgen
         run: pip install --quiet dnsgen
 
-      # ---------- wordlists + resolvers ----------
       - name: Download wordlists
         run: |
           mkdir -p wordlists
-          # Main subdomain brute-force list (~5,000 entries — fast, safe)
           curl -fsSL \
             https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-5000.txt \
             -o wordlists/subdomains.txt
-
-          # Permutation list for recursion
-          # Note: dns-Jhaddix.txt is the standard permutation wordlist in SecLists.
-          # Discovery/DNS/permutations.txt does NOT exist (404).
           curl -fsSL \
             https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/dns-Jhaddix.txt \
             -o wordlists/permutations.txt
-
-          echo "[+] wordlist sizes:"
           wc -l wordlists/subdomains.txt wordlists/permutations.txt
           test -s wordlists/subdomains.txt
           test -s wordlists/permutations.txt
@@ -120,9 +113,10 @@ jobs:
           test -s resolvers.txt
           echo "resolvers.txt lines: $(wc -l < resolvers.txt)"
 
-      # ---------- run ----------
       - name: Make script executable
-        run: chmod +x subfuzz.sh
+        run: |
+          test -f subfuzz.sh || { echo "❌ subfuzz.sh missing"; exit 1; }
+          chmod +x subfuzz.sh
 
       - name: Run enumeration
         env:
@@ -133,17 +127,9 @@ jobs:
           RATE:    ${{ inputs.rate }}
         run: |
           set -euo pipefail
-
-          # basic sanity check on the domain input
           [[ "$TARGET" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]] || { echo "invalid domain: $TARGET"; exit 1; }
 
-          ARGS=(
-            -d "$TARGET"
-            -w wordlists/subdomains.txt
-            -r resolvers.txt
-            -t "$THREADS"
-            -R "$RATE"
-          )
+          ARGS=(-d "$TARGET" -w wordlists/subdomains.txt -r resolvers.txt -t "$THREADS" -R "$RATE")
 
           if [ "$MODE" = "passive" ]; then
             ARGS+=(--mode passive)
@@ -154,7 +140,6 @@ jobs:
           echo "▶ ./subfuzz.sh ${ARGS[*]}"
           ./subfuzz.sh "${ARGS[@]}"
 
-      # ---------- outputs ----------
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
@@ -163,6 +148,48 @@ jobs:
           path: subenum_out/
           retention-days: 30
           if-no-files-found: warn
+
+      # ---------- Telegram notify ----------
+      - name: Notify Telegram
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL:            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TARGET:             ${{ inputs.target }}
+          MODE:               ${{ inputs.mode }}
+          DEPTH:              ${{ inputs.depth }}
+          JOB_STATUS:         ${{ job.status }}
+        run: |
+          MSG="$RUNNER_TEMP/tg.txt"
+
+          passive=0; resolved=0; live=0
+          [ -f subenum_out/passive_subs.txt ]  && passive=$(wc -l < subenum_out/passive_subs.txt  | tr -d ' ')
+          [ -f subenum_out/resolved_subs.txt ] && resolved=$(wc -l < subenum_out/resolved_subs.txt | tr -d ' ')
+          [ -f subenum_out/live_hosts.txt ]    && live=$(wc -l < subenum_out/live_hosts.txt    | tr -d ' ')
+
+          {
+            echo "🔍 SUBFUZZ — ${JOB_STATUS}"
+            echo "Target: ${TARGET}"
+            echo "Mode:   ${MODE} (depth=${DEPTH})"
+            echo ""
+            echo "📊 Results"
+            echo "• Passive candidates: ${passive}"
+            echo "• Resolved:           ${resolved}"
+            echo "• Live HTTP hosts:    ${live}"
+            echo ""
+
+            if [ "$live" -gt 0 ]; then
+              echo "🌐 Top live hosts:"
+              head -15 subenum_out/live_hosts.txt | sed 's/^/  /'
+              [ "$live" -gt 15 ] && echo "  ... +$((live - 15)) more"
+              echo ""
+            fi
+
+            echo "🔗 ${RUN_URL}"
+          } > "$MSG"
+
+          bash .github/scripts/telegram.sh -f "$MSG"
 
       - name: Write summary
         if: always()
@@ -177,18 +204,12 @@ jobs:
             echo "| Threads | \`${{ inputs.threads }}\` |"
             echo "| Rate | \`${{ inputs.rate }}\` req/s |"
             echo ""
-
-            if [ -f subenum_out/live_hosts.txt ]; then
+            [ -f subenum_out/live_hosts.txt ] && {
               echo "### ✅ Live hosts ($(wc -l < subenum_out/live_hosts.txt))"
-              echo '```'
-              head -50 subenum_out/live_hosts.txt
-              echo '```'
-            fi
-
-            if [ -f subenum_out/resolved_subs.txt ]; then
-              echo "### 🔎 Resolved subdomains ($(wc -l < subenum_out/resolved_subs.txt))"
-              echo '```'
-              head -50 subenum_out/resolved_subs.txt
-              echo '```'
-            fi
+              echo '```'; head -50 subenum_out/live_hosts.txt; echo '```'
+            }
+            [ -f subenum_out/resolved_subs.txt ] && {
+              echo "### 🔎 Resolved ($(wc -l < subenum_out/resolved_subs.txt))"
+              echo '```'; head -50 subenum_out/resolved_subs.txt; echo '```'
+            }
           } >> "$GITHUB_STEP_SUMMARY"
