@@ -1,0 +1,312 @@
+name: File & Extension Fuzz
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: 'Target(s) — comma or newline separated (e.g. api.example.com,dev.example.com)'
+        required: true
+        type: string
+      wordlist:
+        description: 'Wordlist tier'
+        required: true
+        type: choice
+        default: 'quick'
+        options:
+          - quick       # common.txt (~4.6k) — safest, fastest
+          - standard    # raft-large-files.txt — balanced
+          - backups     # BackupFiles.fuzz.txt — targeted backup hunt
+          - custom      # provide your own URL
+      custom_wordlist:
+        description: 'Custom wordlist URL (only used when wordlist=custom)'
+        required: false
+        type: string
+        default: ''
+      ext_preset:
+        description: 'Extension preset'
+        required: true
+        type: choice
+        default: 'backup'
+        options:
+          - web        # php,html,txt,js,json,xml,css,jpg,png,pdf...
+          - backup     # bak,backup,old,orig,save,swp,tmp...
+          - config     # env,config,yml,log,sql,db,sqlite...
+          - source     # php3,aspx,jsp,jspx,py,rb,pl,sh...
+          - archive    # zip,tar,gz,tgz,7z,rar,war,jar
+          - all        # union of web+backup+config+archive
+          - custom     # provide your own comma-separated list
+      custom_ext:
+        description: 'Custom extension list (only when ext_preset=custom; e.g. .php,.bak,.env)'
+        required: false
+        type: string
+        default: ''
+      force_ext:
+        description: 'Force extensions on every wordlist entry (very noisy — try index.php.bak-style)'
+        required: true
+        type: choice
+        default: 'off'
+        options:
+          - 'off'
+          - 'on'
+      triage:
+        description: 'Run httpx triage after fuzzing'
+        required: true
+        type: choice
+        default: 'on'
+        options:
+          - 'on'
+          - 'off'
+      time_limit:
+        description: 'feroxbuster time limit per target (e.g. 15m, 1h; empty = unlimited)'
+        required: false
+        type: string
+        default: ''
+      threads:
+        description: 'Threads (default 20)'
+        required: false
+        type: string
+        default: '20'
+      rate:
+        description: 'Max requests/sec (empty = auto: 20 for quick, 40 for others)'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: filefuzz-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  filefuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      # ---------- verify the script is in the checkout ----------
+      - name: Verify script exists
+        run: |
+          echo "▶ Working directory: $(pwd)"
+          echo "▶ Top-level contents:"
+          ls -la
+          echo ""
+          echo "▶ Looking for filefuzz.sh..."
+          if [ ! -f filefuzz.sh ]; then
+            echo "❌ filefuzz.sh NOT FOUND in the repository checkout."
+            echo "   Common causes:"
+            echo "   1. Never committed (git add / commit / push)"
+            echo "   2. Lives in a subfolder (e.g. scripts/filefuzz.sh)"
+            echo "   3. Different filename"
+            echo "   4. Excluded by .gitignore"
+            echo "   5. Workflow dispatched from a branch without the file"
+            echo ""
+            echo "   Files present (*.sh):"
+            find . -maxdepth 3 -name '*.sh' -not -path './.git/*' || true
+            exit 1
+          fi
+          echo "✅ filefuzz.sh found ($(wc -l < filefuzz.sh) lines)"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Install base packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq curl unzip
+
+      - name: Install ffuf + httpx + uro
+        run: |
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          go install github.com/ffuf/ffuf/v2@latest
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          pip3 install --quiet uro
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          ffuf -V
+          httpx -version
+          uro --help >/dev/null && echo "uro OK"
+
+      - name: Install feroxbuster
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sL https://raw.githubusercontent.com/epi052/feroxbuster/main/install-nix.sh \
+            | bash -s "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/feroxbuster" --version
+
+      - name: Download wordlist
+        id: wl
+        run: |
+          mkdir -p wordlists
+          case "${{ inputs.wordlist }}" in
+            quick)
+              URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt"
+              ;;
+            standard)
+              URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-large-files.txt"
+              ;;
+            backups)
+              URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/BackupFiles.fuzz.txt"
+              ;;
+            custom)
+              if [ -z "${{ inputs.custom_wordlist }}" ]; then
+                echo "[-] custom_wordlist URL required when wordlist=custom"
+                exit 1
+              fi
+              URL="${{ inputs.custom_wordlist }}"
+              ;;
+          esac
+          echo "Downloading: $URL"
+          curl -fsSL "$URL" -o wordlists/target.txt
+          lines=$(wc -l < wordlists/target.txt | tr -d ' ')
+          echo "lines=$lines" >> "$GITHUB_OUTPUT"
+          echo "[+] $lines entries"
+          head -3 wordlists/target.txt
+
+      - name: Parse targets
+        id: parse
+        env:
+          TARGETS: ${{ inputs.targets }}
+        run: |
+          mkdir -p work
+          printf '%s' "$TARGETS" \
+            | tr ',' '\n' \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+            | sed '/^$/d' \
+            > work/subs.txt
+          n=$(wc -l < work/subs.txt | tr -d ' ')
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          cat work/subs.txt
+          test -s work/subs.txt
+
+      - name: Make script executable
+        run: |
+          test -f filefuzz.sh || { echo "❌ filefuzz.sh missing — see 'Verify script exists' step above"; exit 1; }
+          chmod +x filefuzz.sh
+          ls -l filefuzz.sh
+
+      - name: Run file & extension fuzz
+        env:
+          THREADS:   ${{ inputs.threads }}
+          RATE_IN:   ${{ inputs.rate }}
+          WL_TIER:   ${{ inputs.wordlist }}
+          EXT_SET:   ${{ inputs.ext_preset }}
+          CUSTOM_EXT: ${{ inputs.custom_ext }}
+          FORCE_EXT: ${{ inputs.force_ext }}
+          TRIAGE:    ${{ inputs.triage }}
+          TIME_LIMIT: ${{ inputs.time_limit }}
+        run: |
+          set -euo pipefail
+
+          RATE="$RATE_IN"
+          if [ -z "$RATE" ]; then
+            case "$WL_TIER" in
+              quick) RATE=20 ;;
+              *)     RATE=40 ;;
+            esac
+            echo "[*] Auto rate: $RATE req/s (${WL_TIER})"
+          fi
+
+          ARGS=(
+            -w wordlists/target.txt
+            -l work/subs.txt
+            -t "$THREADS"
+            -r "$RATE"
+            -o filefuzz_out
+          )
+
+          # Extension preset vs custom extension list
+          if [ "$EXT_SET" = "custom" ]; then
+            if [ -z "$CUSTOM_EXT" ]; then
+              echo "[-] ext_preset=custom requires custom_ext to be set"
+              exit 1
+            fi
+            ARGS+=(--ext "$CUSTOM_EXT")
+          else
+            ARGS+=(-e "$EXT_SET")
+          fi
+
+          # Force extensions
+          [ "$FORCE_EXT" = "on" ] && ARGS+=(--force-ext)
+
+          # Optional time limit
+          [ -n "$TIME_LIMIT" ] && ARGS+=(--time "$TIME_LIMIT")
+
+          # Triage toggle
+          [ "$TRIAGE" = "off" ] && ARGS+=(--no-triage)
+
+          echo "▶ ./filefuzz.sh ${ARGS[*]}"
+          ./filefuzz.sh "${ARGS[@]}"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: filefuzz-${{ github.run_id }}
+          path: filefuzz_out/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## File & Extension Fuzz"
+            echo ""
+            echo "| Setting | Value |"
+            echo "|---|---|"
+            echo "| Targets | ${{ steps.parse.outputs.count }} |"
+            echo "| Wordlist | \`${{ inputs.wordlist }}\` (${{ steps.wl.outputs.lines }} entries) |"
+            echo "| Ext preset | \`${{ inputs.ext_preset }}\` |"
+            echo "| Custom ext | \`${{ inputs.custom_ext }}\` |"
+            echo "| Force ext | \`${{ inputs.force_ext }}\` |"
+            echo "| Triage | \`${{ inputs.triage }}\` |"
+            echo "| Time limit | \`${{ inputs.time_limit }}\` |"
+            echo "| Threads | \`${{ inputs.threads }}\` |"
+            echo "| Rate | \`${{ inputs.rate }}\` (empty = auto) |"
+            echo ""
+            echo "### Targets"
+            echo '```'
+            cat work/subs.txt 2>/dev/null || echo "(none)"
+            echo '```'
+            echo ""
+
+            if [ -f filefuzz_out/ALL_UNIQUE_FILES.txt ]; then
+              n=$(wc -l < filefuzz_out/ALL_UNIQUE_FILES.txt | tr -d ' ')
+              echo "### ✅ Unique URLs found: $n"
+              echo '```'
+              head -50 filefuzz_out/ALL_UNIQUE_FILES.txt
+              [ "$n" -gt 50 ] && echo "... ($((n - 50)) more)"
+              echo '```'
+              echo ""
+            else
+              echo "### ⚠️ No master file produced"
+            fi
+
+            if [ -f filefuzz_out/triage_sensitive.txt ]; then
+              s=$(wc -l < filefuzz_out/triage_sensitive.txt | tr -d ' ')
+              echo "### 🎯 Sensitive files (backups/configs/archives): $s"
+              echo '```'
+              head -30 filefuzz_out/triage_sensitive.txt
+              [ "$s" -gt 30 ] && echo "... ($((s - 30)) more)"
+              echo '```'
+              echo ""
+            fi
+
+            if [ -f filefuzz_out/triage_interesting.txt ]; then
+              i=$(wc -l < filefuzz_out/triage_interesting.txt | tr -d ' ')
+              echo "### 🔎 Interesting (2xx/3xx/401/403): $i"
+              echo '```'
+              head -30 filefuzz_out/triage_interesting.txt
+              [ "$i" -gt 30 ] && echo "... ($((i - 30)) more)"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
