@@ -60,6 +60,34 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Make sure we grab the branch the workflow was dispatched from
+          ref: ${{ github.ref }}
+
+      # ---------- NEW: verify the script is actually in the checkout ----------
+      - name: Verify script exists
+        run: |
+          echo "▶ Working directory: $(pwd)"
+          echo "▶ Repo contents (top level):"
+          ls -la
+
+          echo ""
+          echo "▶ Looking for fuzzall.sh..."
+          if [ ! -f fuzzall.sh ]; then
+            echo "❌ fuzzall.sh NOT FOUND in the repository checkout."
+            echo ""
+            echo "   Common causes:"
+            echo "   1. The file was never committed (git add / git commit / git push)"
+            echo "   2. The file is in a subfolder (e.g. scripts/fuzzall.sh)"
+            echo "   3. The file is named differently (e.g. dirfuzz.sh)"
+            echo "   4. .gitignore is excluding it"
+            echo "   5. You ran the workflow from a branch that doesn't have it"
+            echo ""
+            echo "   Files actually present (*.sh):"
+            find . -maxdepth 3 -name '*.sh' -not -path './.git/*' || true
+            exit 1
+          fi
+          echo "✅ fuzzall.sh found ($(wc -l < fuzzall.sh) lines)"
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -116,7 +144,6 @@ jobs:
           lines=$(wc -l < wordlists/target.txt | tr -d ' ')
           echo "lines=$lines" >> "$GITHUB_OUTPUT"
           echo "[+] $lines entries"
-          head -3 wordlists/target.txt
 
       - name: Parse targets
         id: parse
@@ -131,20 +158,23 @@ jobs:
             > work/subs.txt
           n=$(wc -l < work/subs.txt | tr -d ' ')
           echo "count=$n" >> "$GITHUB_OUTPUT"
-          echo "--- $n target(s) ---"
           cat work/subs.txt
           test -s work/subs.txt
 
       - name: Make script executable
-        run: chmod +x fuzzall.sh
+        run: |
+          # safety net: fail early with a clear message instead of a bare chmod error
+          test -f fuzzall.sh || { echo "❌ fuzzall.sh missing — see 'Verify script exists' step above"; exit 1; }
+          chmod +x fuzzall.sh
+          ls -l fuzzall.sh
 
       - name: Run directory fuzz
         env:
-          THREADS:  ${{ inputs.threads }}
-          RATE_IN:  ${{ inputs.rate }}
-          DEPTH:    ${{ inputs.depth }}
+          THREADS:   ${{ inputs.threads }}
+          RATE_IN:   ${{ inputs.rate }}
+          DEPTH:     ${{ inputs.depth }}
           RECURSION: ${{ inputs.recursion }}
-          WL_TIER:  ${{ inputs.wordlist }}
+          WL_TIER:   ${{ inputs.wordlist }}
         run: |
           set -euo pipefail
 
@@ -197,11 +227,6 @@ jobs:
             echo "| Depth | \`${{ inputs.depth }}\` |"
             echo "| Threads | \`${{ inputs.threads }}\` |"
             echo "| Rate | \`${{ inputs.rate }}\` (empty = auto) |"
-            echo ""
-            echo "### Targets"
-            echo '```'
-            cat work/subs.txt 2>/dev/null || echo "(none)"
-            echo '```'
             echo ""
             if [ -f fuzz_out/ALL_UNIQUE_URLS.txt ]; then
               n=$(wc -l < fuzz_out/ALL_UNIQUE_URLS.txt | tr -d ' ')
