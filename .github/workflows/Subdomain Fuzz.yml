@@ -93,9 +93,22 @@ jobs:
       - name: Download wordlists
         run: |
           mkdir -p wordlists
-          curl -fsSL https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-5000.txt -o wordlists/subdomains.txt
-          curl -fsSL https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/permutations.txt            -o wordlists/permutations.txt
+          # Main subdomain brute-force list (~5,000 entries — fast, safe)
+          curl -fsSL \
+            https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-5000.txt \
+            -o wordlists/subdomains.txt
+
+          # Permutation list for recursion
+          # Note: dns-Jhaddix.txt is the standard permutation wordlist in SecLists.
+          # Discovery/DNS/permutations.txt does NOT exist (404).
+          curl -fsSL \
+            https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/dns-Jhaddix.txt \
+            -o wordlists/permutations.txt
+
+          echo "[+] wordlist sizes:"
           wc -l wordlists/subdomains.txt wordlists/permutations.txt
+          test -s wordlists/subdomains.txt
+          test -s wordlists/permutations.txt
 
       - name: Initialize resolvers
         run: |
