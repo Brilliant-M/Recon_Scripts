@@ -1,0 +1,216 @@
+name: Directory Fuzz
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: 'Target(s) — comma or newline separated (e.g. api.example.com,dev.example.com)'
+        required: true
+        type: string
+      wordlist:
+        description: 'Wordlist tier'
+        required: true
+        type: choice
+        default: 'quick'
+        options:
+          - quick       # common.txt (~4.6k) — safest, fastest
+          - standard    # directory-list-2.3-medium.txt (~220k) — balanced
+          - deep        # raft-large-directories.txt (~900k+) — slow
+          - custom      # provide your own URL
+      custom_wordlist:
+        description: 'Custom wordlist URL (only used when wordlist=custom)'
+        required: false
+        type: string
+        default: ''
+      recursion:
+        description: 'Recursion (feroxbuster)'
+        required: true
+        type: choice
+        default: 'off'
+        options:
+          - 'off'
+          - 'on'
+      depth:
+        description: 'Max recursion depth (only when recursion=on; 0 = unlimited)'
+        required: false
+        type: string
+        default: '2'
+      threads:
+        description: 'Threads (default 20)'
+        required: false
+        type: string
+        default: '20'
+      rate:
+        description: 'Max requests/sec (empty = auto: 20 for quick, 50 for standard/deep)'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: dirfuzz-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Install base packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq curl unzip dnsutils
+
+      - name: Install ffuf + uro
+        run: |
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          go install github.com/ffuf/ffuf/v2@latest
+          pip3 install --quiet uro
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          ffuf -V
+          uro --help >/dev/null && echo "uro OK"
+
+      - name: Install feroxbuster
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sL https://raw.githubusercontent.com/epi052/feroxbuster/main/install-nix.sh \
+            | bash -s "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/feroxbuster" --version
+
+      - name: Download wordlist
+        id: wl
+        run: |
+          mkdir -p wordlists
+          case "${{ inputs.wordlist }}" in
+            quick)
+              URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt"
+              ;;
+            standard)
+              URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/directory-list-2.3-medium.txt"
+              ;;
+            deep)
+              URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-large-directories.txt"
+              ;;
+            custom)
+              if [ -z "${{ inputs.custom_wordlist }}" ]; then
+                echo "[-] custom_wordlist URL required when wordlist=custom"
+                exit 1
+              fi
+              URL="${{ inputs.custom_wordlist }}"
+              ;;
+          esac
+          echo "Downloading: $URL"
+          curl -fsSL "$URL" -o wordlists/target.txt
+          lines=$(wc -l < wordlists/target.txt | tr -d ' ')
+          echo "lines=$lines" >> "$GITHUB_OUTPUT"
+          echo "[+] $lines entries"
+          head -3 wordlists/target.txt
+
+      - name: Parse targets
+        id: parse
+        env:
+          TARGETS: ${{ inputs.targets }}
+        run: |
+          mkdir -p work
+          printf '%s' "$TARGETS" \
+            | tr ',' '\n' \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+            | sed '/^$/d' \
+            > work/subs.txt
+          n=$(wc -l < work/subs.txt | tr -d ' ')
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          echo "--- $n target(s) ---"
+          cat work/subs.txt
+          test -s work/subs.txt
+
+      - name: Make script executable
+        run: chmod +x fuzzall.sh
+
+      - name: Run directory fuzz
+        env:
+          THREADS:  ${{ inputs.threads }}
+          RATE_IN:  ${{ inputs.rate }}
+          DEPTH:    ${{ inputs.depth }}
+          RECURSION: ${{ inputs.recursion }}
+          WL_TIER:  ${{ inputs.wordlist }}
+        run: |
+          set -euo pipefail
+
+          RATE="$RATE_IN"
+          if [ -z "$RATE" ]; then
+            case "$WL_TIER" in
+              quick) RATE=20 ;;
+              *)     RATE=50 ;;
+            esac
+            echo "[*] Auto rate: $RATE req/s (${WL_TIER})"
+          fi
+
+          ARGS=(
+            -w wordlists/target.txt
+            -l work/subs.txt
+            -t "$THREADS"
+            -R "$RATE"
+            -o fuzz_out
+          )
+
+          if [ "$RECURSION" = "off" ]; then
+            ARGS+=(--no-recursion)
+          elif [ -n "$DEPTH" ] && [ "$DEPTH" != "0" ]; then
+            ARGS+=(-d "$DEPTH")
+          fi
+
+          echo "▶ ./fuzzall.sh ${ARGS[*]}"
+          ./fuzzall.sh "${ARGS[@]}"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dirfuzz-${{ github.run_id }}
+          path: fuzz_out/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Directory Fuzz"
+            echo ""
+            echo "| Setting | Value |"
+            echo "|---|---|"
+            echo "| Targets | ${{ steps.parse.outputs.count }} |"
+            echo "| Wordlist | \`${{ inputs.wordlist }}\` (${{ steps.wl.outputs.lines }} entries) |"
+            echo "| Recursion | \`${{ inputs.recursion }}\` |"
+            echo "| Depth | \`${{ inputs.depth }}\` |"
+            echo "| Threads | \`${{ inputs.threads }}\` |"
+            echo "| Rate | \`${{ inputs.rate }}\` (empty = auto) |"
+            echo ""
+            echo "### Targets"
+            echo '```'
+            cat work/subs.txt 2>/dev/null || echo "(none)"
+            echo '```'
+            echo ""
+            if [ -f fuzz_out/ALL_UNIQUE_URLS.txt ]; then
+              n=$(wc -l < fuzz_out/ALL_UNIQUE_URLS.txt | tr -d ' ')
+              echo "### ✅ Unique URLs found: $n"
+              echo '```'
+              head -100 fuzz_out/ALL_UNIQUE_URLS.txt
+              [ "$n" -gt 100 ] && echo "... ($((n - 100)) more)"
+              echo '```'
+            else
+              echo "### ⚠️ No master file produced"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
