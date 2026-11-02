@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       targets:
-        description: 'Target(s) — comma or newline separated (e.g. api.example.com,dev.example.com)'
+        description: 'Target(s) — comma or newline separated'
         required: true
         type: string
       wordlist:
@@ -12,13 +12,9 @@ on:
         required: true
         type: choice
         default: 'quick'
-        options:
-          - quick       # common.txt (~4.6k) — safest, fastest
-          - standard    # directory-list-2.3-medium.txt (~220k) — balanced
-          - deep        # raft-large-directories.txt (~900k+) — slow
-          - custom      # provide your own URL
+        options: [quick, standard, deep, custom]
       custom_wordlist:
-        description: 'Custom wordlist URL (only used when wordlist=custom)'
+        description: 'Custom wordlist URL (only when wordlist=custom)'
         required: false
         type: string
         default: ''
@@ -27,11 +23,9 @@ on:
         required: true
         type: choice
         default: 'off'
-        options:
-          - 'off'
-          - 'on'
+        options: ['off', 'on']
       depth:
-        description: 'Max recursion depth (only when recursion=on; 0 = unlimited)'
+        description: 'Max recursion depth (recursion=on only; 0=unlimited)'
         required: false
         type: string
         default: '2'
@@ -41,7 +35,7 @@ on:
         type: string
         default: '20'
       rate:
-        description: 'Max requests/sec (empty = auto: 20 for quick, 50 for standard/deep)'
+        description: 'Max req/sec (empty = auto)'
         required: false
         type: string
         default: ''
@@ -61,33 +55,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # Make sure we grab the branch the workflow was dispatched from
           ref: ${{ github.ref }}
 
-      # ---------- NEW: verify the script is actually in the checkout ----------
-      - name: Verify script exists
+      - name: Verify scripts exist
         run: |
-          echo "▶ Working directory: $(pwd)"
-          echo "▶ Repo contents (top level):"
-          ls -la
-
-          echo ""
-          echo "▶ Looking for fuzzall.sh..."
-          if [ ! -f fuzzall.sh ]; then
-            echo "❌ fuzzall.sh NOT FOUND in the repository checkout."
-            echo ""
-            echo "   Common causes:"
-            echo "   1. The file was never committed (git add / git commit / git push)"
-            echo "   2. The file is in a subfolder (e.g. scripts/fuzzall.sh)"
-            echo "   3. The file is named differently (e.g. dirfuzz.sh)"
-            echo "   4. .gitignore is excluding it"
-            echo "   5. You ran the workflow from a branch that doesn't have it"
-            echo ""
-            echo "   Files actually present (*.sh):"
-            find . -maxdepth 3 -name '*.sh' -not -path './.git/*' || true
-            exit 1
-          fi
-          echo "✅ fuzzall.sh found ($(wc -l < fuzzall.sh) lines)"
+          test -f fuzzall.sh                 || { echo "❌ fuzzall.sh missing"; exit 1; }
+          test -f .github/scripts/telegram.sh || { echo "❌ telegram.sh missing"; exit 1; }
+          echo "✅ scripts present"
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -122,20 +96,11 @@ jobs:
         run: |
           mkdir -p wordlists
           case "${{ inputs.wordlist }}" in
-            quick)
-              URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt"
-              ;;
-            standard)
-              URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/directory-list-2.3-medium.txt"
-              ;;
-            deep)
-              URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-large-directories.txt"
-              ;;
+            quick)    URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt" ;;
+            standard) URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/directory-list-2.3-medium.txt" ;;
+            deep)     URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-large-directories.txt" ;;
             custom)
-              if [ -z "${{ inputs.custom_wordlist }}" ]; then
-                echo "[-] custom_wordlist URL required when wordlist=custom"
-                exit 1
-              fi
+              [ -z "${{ inputs.custom_wordlist }}" ] && { echo "❌ custom_wordlist URL required"; exit 1; }
               URL="${{ inputs.custom_wordlist }}"
               ;;
           esac
@@ -151,10 +116,8 @@ jobs:
           TARGETS: ${{ inputs.targets }}
         run: |
           mkdir -p work
-          printf '%s' "$TARGETS" \
-            | tr ',' '\n' \
-            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-            | sed '/^$/d' \
+          printf '%s' "$TARGETS" | tr ',' '\n' \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d' \
             > work/subs.txt
           n=$(wc -l < work/subs.txt | tr -d ' ')
           echo "count=$n" >> "$GITHUB_OUTPUT"
@@ -163,44 +126,29 @@ jobs:
 
       - name: Make script executable
         run: |
-          # safety net: fail early with a clear message instead of a bare chmod error
-          test -f fuzzall.sh || { echo "❌ fuzzall.sh missing — see 'Verify script exists' step above"; exit 1; }
+          test -f fuzzall.sh || { echo "❌ fuzzall.sh missing"; exit 1; }
           chmod +x fuzzall.sh
-          ls -l fuzzall.sh
 
       - name: Run directory fuzz
         env:
-          THREADS:   ${{ inputs.threads }}
-          RATE_IN:   ${{ inputs.rate }}
-          DEPTH:     ${{ inputs.depth }}
-          RECURSION: ${{ inputs.recursion }}
-          WL_TIER:   ${{ inputs.wordlist }}
+          THREADS:    ${{ inputs.threads }}
+          RATE_IN:    ${{ inputs.rate }}
+          DEPTH:      ${{ inputs.depth }}
+          RECURSION:  ${{ inputs.recursion }}
+          WL_TIER:    ${{ inputs.wordlist }}
         run: |
           set -euo pipefail
-
           RATE="$RATE_IN"
           if [ -z "$RATE" ]; then
-            case "$WL_TIER" in
-              quick) RATE=20 ;;
-              *)     RATE=50 ;;
-            esac
-            echo "[*] Auto rate: $RATE req/s (${WL_TIER})"
+            case "$WL_TIER" in quick) RATE=20 ;; *) RATE=50 ;; esac
+            echo "[*] Auto rate: $RATE req/s"
           fi
-
-          ARGS=(
-            -w wordlists/target.txt
-            -l work/subs.txt
-            -t "$THREADS"
-            -R "$RATE"
-            -o fuzz_out
-          )
-
+          ARGS=(-w wordlists/target.txt -l work/subs.txt -t "$THREADS" -R "$RATE" -o fuzz_out)
           if [ "$RECURSION" = "off" ]; then
             ARGS+=(--no-recursion)
           elif [ -n "$DEPTH" ] && [ "$DEPTH" != "0" ]; then
             ARGS+=(-d "$DEPTH")
           fi
-
           echo "▶ ./fuzzall.sh ${ARGS[*]}"
           ./fuzzall.sh "${ARGS[@]}"
 
@@ -213,29 +161,68 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
+      # ---------- Telegram notify ----------
+      - name: Notify Telegram
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL:            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TARGET_COUNT:       ${{ steps.parse.outputs.count }}
+          WL_TIER:            ${{ inputs.wordlist }}
+          RECURSION:          ${{ inputs.recursion }}
+          JOB_STATUS:         ${{ job.status }}
+        run: |
+          MSG="$RUNNER_TEMP/tg.txt"
+
+          total=0
+          [ -f fuzz_out/ALL_UNIQUE_URLS.txt ] && total=$(wc -l < fuzz_out/ALL_UNIQUE_URLS.txt | tr -d ' ')
+
+          {
+            echo "📂 DIR FUZZ — ${JOB_STATUS}"
+            echo "Targets: ${TARGET_COUNT}"
+            echo "Wordlist: ${WL_TIER} | Recursion: ${RECURSION}"
+            echo ""
+            echo "📊 Results"
+            echo "• Unique URLs: ${total}"
+            echo ""
+
+            # per-target counts
+            if compgen -G "fuzz_out/*.urls.txt" >/dev/null; then
+              echo "📁 Per-target:"
+              for f in fuzz_out/*.urls.txt; do
+                n=$(wc -l < "$f" | tr -d ' ')
+                name=$(basename "$f" .urls.txt)
+                echo "  ${name}: ${n}"
+              done
+              echo ""
+            fi
+
+            if [ "$total" -gt 0 ]; then
+              echo "🎯 Top URLs:"
+              head -20 fuzz_out/ALL_UNIQUE_URLS.txt | sed 's/^/  /'
+              [ "$total" -gt 20 ] && echo "  ... +$((total - 20)) more"
+              echo ""
+            fi
+
+            echo "🔗 ${RUN_URL}"
+          } > "$MSG"
+
+          bash .github/scripts/telegram.sh -f "$MSG"
+
       - name: Summary
         if: always()
         run: |
           {
             echo "## Directory Fuzz"
-            echo ""
-            echo "| Setting | Value |"
-            echo "|---|---|"
             echo "| Targets | ${{ steps.parse.outputs.count }} |"
             echo "| Wordlist | \`${{ inputs.wordlist }}\` (${{ steps.wl.outputs.lines }} entries) |"
             echo "| Recursion | \`${{ inputs.recursion }}\` |"
             echo "| Depth | \`${{ inputs.depth }}\` |"
-            echo "| Threads | \`${{ inputs.threads }}\` |"
-            echo "| Rate | \`${{ inputs.rate }}\` (empty = auto) |"
             echo ""
             if [ -f fuzz_out/ALL_UNIQUE_URLS.txt ]; then
               n=$(wc -l < fuzz_out/ALL_UNIQUE_URLS.txt | tr -d ' ')
-              echo "### ✅ Unique URLs found: $n"
-              echo '```'
-              head -100 fuzz_out/ALL_UNIQUE_URLS.txt
-              [ "$n" -gt 100 ] && echo "... ($((n - 100)) more)"
-              echo '```'
-            else
-              echo "### ⚠️ No master file produced"
+              echo "### ✅ Unique URLs: $n"
+              echo '```'; head -100 fuzz_out/ALL_UNIQUE_URLS.txt; echo '```'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
