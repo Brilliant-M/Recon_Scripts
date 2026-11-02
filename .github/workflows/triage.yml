@@ -4,17 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       urls:
-        description: 'URLs to triage (paste one per line, or comma-separated)'
+        description: 'URLs to triage (newline or comma separated, optional if source_run_id set)'
         required: false
         type: string
         default: ''
       source_run_id:
-        description: 'Optional: prior workflow run ID to pull artifacts from (chains fuzz → triage)'
+        description: 'Prior workflow run ID to pull artifacts from (optional)'
         required: false
         type: string
         default: ''
       source_patterns:
-        description: 'Filenames to pull from artifacts (comma-separated)'
+        description: 'Artifact filenames to pull (comma-separated)'
         required: false
         type: string
         default: 'ALL_UNIQUE_FILES.txt,ALL_UNIQUE_URLS.txt,live_hosts.txt'
@@ -34,15 +34,13 @@ on:
         type: string
         default: '3'
       soft404:
-        description: 'Soft-404 detection (1=on, 0=off)'
+        description: 'Soft-404 detection'
         required: true
         type: choice
         default: '1'
-        options:
-          - '1'
-          - '0'
+        options: ['1', '0']
       headers:
-        description: 'Custom headers, one per line (e.g. Cookie: session=abc)'
+        description: 'Custom headers, one per line'
         required: false
         type: string
         default: ''
@@ -57,7 +55,7 @@ jobs:
     timeout-minutes: 120
     permissions:
       contents: read
-      actions: read          # REQUIRED: to download artifacts from a prior run
+      actions: read
 
     steps:
       - name: Checkout
@@ -65,21 +63,12 @@ jobs:
         with:
           ref: ${{ github.ref }}
 
-      # ---------- verify the script is committed ----------
-      - name: Verify script exists
+      - name: Verify scripts exist
         run: |
-          echo "▶ Working directory: $(pwd)"
-          ls -la
-          echo ""
-          if [ ! -f triage.sh ]; then
-            echo "❌ triage.sh NOT FOUND in repository checkout."
-            echo "   Files present (*.sh):"
-            find . -maxdepth 3 -name '*.sh' -not -path './.git/*' || true
-            exit 1
-          fi
-          echo "✅ triage.sh found ($(wc -l < triage.sh) lines)"
+          test -f triage.sh                   || { echo "❌ triage.sh missing"; exit 1; }
+          test -f .github/scripts/telegram.sh || { echo "❌ telegram.sh missing"; exit 1; }
+          echo "✅ scripts present"
 
-      # ---------- install deps ----------
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
@@ -100,7 +89,6 @@ jobs:
           httpx -version
           uro --help >/dev/null && echo "uro OK"
 
-      # ---------- optional: pull prior artifacts ----------
       - name: Download prior artifacts
         if: ${{ inputs.source_run_id != '' }}
         uses: actions/download-artifact@v4
@@ -110,45 +98,32 @@ jobs:
           path: prior_artifacts/
           merge-multiple: true
 
-      # ---------- prepare URL input ----------
       - name: Prepare URLs
         env:
-          URLS: ${{ inputs.urls }}
-          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          URLS:            ${{ inputs.urls }}
+          SOURCE_RUN_ID:   ${{ inputs.source_run_id }}
           SOURCE_PATTERNS: ${{ inputs.source_patterns }}
         run: |
           mkdir -p work
           : > work/urls.txt
 
-          # 1. From the textarea
           if [ -n "$URLS" ]; then
-            echo "[*] Reading URLs from input"
-            printf '%s\n' "$URLS" \
-              | tr ',' '\n' \
-              | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-              | sed '/^$/d' \
+            printf '%s\n' "$URLS" | tr ',' '\n' \
+              | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d' \
               >> work/urls.txt
           fi
 
-          # 2. From prior artifacts
           if [ -n "$SOURCE_RUN_ID" ]; then
-            if [ ! -d prior_artifacts ]; then
-              echo "❌ source_run_id set but prior_artifacts/ not found"
-              exit 1
-            fi
-            echo "[*] Pulling from prior artifacts (run $SOURCE_RUN_ID)"
+            [ ! -d prior_artifacts ] && { echo "❌ prior_artifacts missing"; exit 1; }
             IFS=',' read -ra patterns <<< "$SOURCE_PATTERNS"
             for p in "${patterns[@]}"; do
               p_trim=$(echo "$p" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
               [ -z "$p_trim" ] && continue
-              echo "  → $p_trim"
               find prior_artifacts -type f -name "$p_trim" -exec cat {} + >> work/urls.txt 2>/dev/null || true
             done
           fi
 
-          # 3. Fallback if nothing matched
           if [ ! -s work/urls.txt ] && [ -d prior_artifacts ]; then
-            echo "[!] No files matched patterns — falling back to common filenames"
             find prior_artifacts -type f \
               \( -name 'ALL_UNIQUE_*.txt' -o -name 'live_hosts.txt' \) \
               -exec cat {} + >> work/urls.txt 2>/dev/null || true
@@ -156,15 +131,10 @@ jobs:
 
           sort -u work/urls.txt -o work/urls.txt
           n=$(wc -l < work/urls.txt | tr -d ' ')
-          echo "[+] Total unique URLs: $n"
-          if [ "$n" -eq 0 ]; then
-            echo "❌ No URLs to triage. Provide 'urls' or a valid 'source_run_id'."
-            exit 1
-          fi
-          echo "--- preview ---"
+          echo "[+] Total URLs: $n"
+          [ "$n" -eq 0 ] && { echo "❌ No URLs to triage"; exit 1; }
           head -10 work/urls.txt
 
-      # ---------- prepare headers ----------
       - name: Prepare headers
         if: ${{ inputs.headers != '' }}
         env:
@@ -172,44 +142,30 @@ jobs:
         run: |
           mkdir -p work
           printf '%s\n' "$HEADERS" | sed '/^$/d' > work/headers.txt
-          echo "[*] Custom headers:"
-          wc -l work/headers.txt
+          echo "[*] $(wc -l < work/headers.txt) custom header(s)"
 
-      # ---------- run triage ----------
       - name: Make script executable
         run: |
           test -f triage.sh || { echo "❌ triage.sh missing"; exit 1; }
           chmod +x triage.sh
-          ls -l triage.sh
 
       - name: Run triage
         env:
-          THREADS:     ${{ inputs.threads }}
-          RATE:        ${{ inputs.rate }}
-          MIN_SCORE:   ${{ inputs.min_score }}
-          SOFT404:     ${{ inputs.soft404 }}
+          THREADS:   ${{ inputs.threads }}
+          RATE:      ${{ inputs.rate }}
+          MIN_SCORE: ${{ inputs.min_score }}
+          SOFT404:   ${{ inputs.soft404 }}
         run: |
           set -euo pipefail
-
-          ARGS=(
-            -l work/urls.txt
-            -o triage_out
-            -t "$THREADS"
-            -r "$RATE"
-            --min-score "$MIN_SCORE"
-            --soft404 "$SOFT404"
-          )
-
+          ARGS=(-l work/urls.txt -o triage_out -t "$THREADS" -r "$RATE" --min-score "$MIN_SCORE" --soft404 "$SOFT404")
           if [ -f work/headers.txt ]; then
             while IFS= read -r h; do
               [ -n "$h" ] && ARGS+=(-H "$h")
             done < work/headers.txt
           fi
-
           echo "▶ ./triage.sh ${ARGS[*]}"
           ./triage.sh "${ARGS[@]}"
 
-      # ---------- outputs ----------
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
@@ -219,43 +175,67 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
+      # ---------- Telegram notify ----------
+      - name: Notify Telegram
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL:            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MIN_SCORE:          ${{ inputs.min_score }}
+          JOB_STATUS:         ${{ job.status }}
+        run: |
+          MSG="$RUNNER_TEMP/tg.txt"
+
+          input=0; short=0; bypass=0; err=0; direct=0; cfg=0
+          [ -f work/urls.txt ]                            && input=$(wc -l < work/urls.txt | tr -d ' ')
+          [ -f triage_out/WORTH_TESTING.txt ]             && short=$(awk '!/^#/' triage_out/WORTH_TESTING.txt | wc -l | tr -d ' ')
+          [ -f triage_out/class_bypass_candidates.txt ]   && bypass=$(wc -l < triage_out/class_bypass_candidates.txt | tr -d ' ')
+          [ -f triage_out/class_error_inject.txt ]        && err=$(wc -l < triage_out/class_error_inject.txt | tr -d ' ')
+          [ -f triage_out/class_direct_hits.txt ]         && direct=$(wc -l < triage_out/class_direct_hits.txt | tr -d ' ')
+          [ -f triage_out/tag_config_backup.txt ]         && cfg=$(wc -l < triage_out/tag_config_backup.txt | tr -d ' ')
+
+          {
+            echo "🎯 TRIAGE — ${JOB_STATUS}"
+            echo "Input: ${input} URLs | Min score: ${MIN_SCORE}"
+            echo ""
+            echo "📊 Results"
+            echo "• Worth testing: ${short}"
+            echo "• 403/401 bypass: ${bypass}"
+            echo "• 5xx errors:     ${err}"
+            echo "• 2xx direct:     ${direct}"
+            echo "• Config/backup:  ${cfg}"
+            echo ""
+
+            if [ "$short" -gt 0 ]; then
+              echo "🏆 Top ranked:"
+              awk '!/^#/' triage_out/WORTH_TESTING.txt | head -15 | sed 's/^/  /'
+              [ "$short" -gt 15 ] && echo "  ... +$((short - 15)) more"
+              echo ""
+            fi
+
+            echo "🔗 ${RUN_URL}"
+          } > "$MSG"
+
+          bash .github/scripts/telegram.sh -f "$MSG"
+
       - name: Summary
         if: always()
         run: |
           {
             echo "## Triage"
-            echo ""
-            echo "| Setting | Value |"
-            echo "|---|---|"
             echo "| Source run | \`${{ inputs.source_run_id }}\` |"
-            echo "| Inline URLs | \`$(echo "${{ inputs.urls }}" | wc -w)\` words |"
-            echo "| Threads | \`${{ inputs.threads }}\` |"
-            echo "| Rate | \`${{ inputs.rate }}\` req/s |"
             echo "| Min score | \`${{ inputs.min_score }}\` |"
             echo "| Soft-404 | \`${{ inputs.soft404 }}\` |"
-            echo "| Custom headers | \`${{ inputs.headers != '' }}\` |"
             echo ""
-
-            if [ -f triage_out/summary.txt ]; then
+            [ -f triage_out/summary.txt ] && {
               echo "### Summary"
-              echo '```'
-              cat triage_out/summary.txt
-              echo '```'
-            fi
-
-            echo ""
-            if [ -f triage_out/WORTH_TESTING.txt ]; then
+              echo '```'; cat triage_out/summary.txt; echo '```'
+            }
+            [ -f triage_out/WORTH_TESTING.txt ] && {
               echo "### 🎯 Worth-testing (top 40)"
               echo '```'
-              head -44 triage_out/WORTH_TESTING.txt | tail -n +5
+              awk '!/^#/' triage_out/WORTH_TESTING.txt | head -40
               echo '```'
-            fi
-
-            echo ""
-            for f in class_bypass_candidates.txt class_error_inject.txt class_direct_hits.txt tag_config_backup.txt; do
-              if [ -f "triage_out/$f" ]; then
-                n=$(wc -l < "triage_out/$f" | tr -d ' ')
-                echo "- \`$f\`: **$n** entries"
-              fi
-            done
+            }
           } >> "$GITHUB_STEP_SUMMARY"
