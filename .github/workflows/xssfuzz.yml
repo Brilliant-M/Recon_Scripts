@@ -107,7 +107,6 @@ jobs:
           test -s wordlists/xss.txt
           head -3 wordlists/xss.txt
 
-      # ---------- PHASE 1 ----------
       - name: Enumerate subdomains
         env:
           TARGET: ${{ inputs.target }}
@@ -129,7 +128,6 @@ jobs:
           echo "[+] Subdomains: $n"
           test "$n" -gt 0 || { echo "❌ No subdomains found"; exit 1; }
 
-      # ---------- PHASE 2 (with WORKING_SUBS output) ----------
       - name: Probe live hosts
         env:
           THREADS: ${{ inputs.threads }}
@@ -146,13 +144,11 @@ jobs:
           echo "[+] Live hosts: $n"
           test "$n" -gt 0 || { echo "❌ No live hosts"; exit 1; }
 
-          # ⭐ NEW: clean URL-only list (no status/title columns)
           awk '{print $1}' work/live_hosts.txt | sort -u > work/WORKING_SUBS.txt
           echo "[+] WORKING_SUBS.txt: $(wc -l < work/WORKING_SUBS.txt | tr -d ' ') URLs"
           echo "--- preview ---"
           head -5 work/WORKING_SUBS.txt
 
-      # ---------- PHASE 3 ----------
       - name: Collect URLs (katana + gau + waybackurls)
         env:
           TARGET: ${{ inputs.target }}
@@ -184,7 +180,6 @@ jobs:
             | sed '/^$/d' | uro | sort -u > work/all_urls.txt || true
           echo "[+] Merged unique URLs: $(wc -l < work/all_urls.txt | tr -d ' ')"
 
-      # ---------- PHASE 4 (with PARAMETERS_WITH_XSS_POTENTIAL + PARAM_NAMES) ----------
       - name: Filter XSS and redirect candidates
         run: |
           set -euo pipefail
@@ -196,25 +191,21 @@ jobs:
           cat work/all_urls.txt | gf redirect > work/redirect_candidates.txt 2>/dev/null || true
           echo "[+] Redirect candidate URLs: $(wc -l < work/redirect_candidates.txt | tr -d ' ')"
 
-          # ⭐ NEW: URL | param1,param2,...  — the actual parameters to test
-          python3 - <<'PY' > work/PARAMETERS_WITH_XSS_POTENTIAL.txt
-import sys, urllib.parse
-with open("work/xss_candidates.txt") as f:
-    for line in f:
-        url = line.strip()
-        if not url:
-            continue
-        q = urllib.parse.urlparse(url).query
-        if not q:
-            continue
-        params = sorted(set(urllib.parse.parse_qs(q).keys()))
-        if params:
-            print(f"{url} | {','.join(params)}")
-PY
+          # Extract parameters using pure bash
+          : > work/PARAMETERS_WITH_XSS_POTENTIAL.txt
+          while IFS= read -r url; do
+            [[ -z "$url" ]] && continue
+            q="${url#*\?}"
+            [[ "$q" == "$url" ]] && continue
+            params=$(echo "$q" | tr '&' '\n' | cut -d'=' -f1 | grep -v '^$' | sort -u | paste -sd, -)
+            if [[ -n "$params" ]]; then
+              echo "$url | $params" >> work/PARAMETERS_WITH_XSS_POTENTIAL.txt
+            fi
+          done < work/xss_candidates.txt
+          
           pcount=$(wc -l < work/PARAMETERS_WITH_XSS_POTENTIAL.txt | tr -d ' ')
           echo "[+] PARAMETERS_WITH_XSS_POTENTIAL.txt: $pcount URLs"
 
-          # ⭐ NEW: ranked unique parameter names
           awk -F'|' '{print $2}' work/PARAMETERS_WITH_XSS_POTENTIAL.txt \
             | tr ',' '\n' | sed 's/^ *//; s/ *$//' | sed '/^$/d' \
             | sort | uniq -c | sort -rn > work/PARAM_NAMES.txt
@@ -226,7 +217,6 @@ PY
           echo "--- Redirect candidates (first 5) ---"
           head -5 work/redirect_candidates.txt || true
 
-      # ---------- PHASE 5 (with CONFIRMED_XSS) ----------
       - name: Run Dalfox XSS scan
         if: ${{ hashFiles('work/xss_candidates.txt') != '' }}
         env:
@@ -243,7 +233,6 @@ PY
               --format json \
               -o work/xss_results.json || true
 
-          # human-readable one-liner list
           if [ -s work/xss_results.json ]; then
             jq -r '
               if type == "array" then .[] else . end
@@ -252,7 +241,6 @@ PY
           fi
           echo "[+] XSS findings: $(wc -l < work/xss_findings.txt 2>/dev/null | tr -d ' ')"
 
-          # ⭐ NEW: structured confirmed-hits list — URL | param | payload
           if [ -s work/xss_results.json ]; then
             jq -r '
               (if type == "array" then .[] else . end)
@@ -262,7 +250,6 @@ PY
             echo "[+] CONFIRMED_XSS.txt: $(wc -l < work/CONFIRMED_XSS.txt 2>/dev/null | tr -d ' ') PoCs"
           fi
 
-      # ---------- PHASE 6 ----------
       - name: Test open redirects
         if: ${{ hashFiles('work/redirect_candidates.txt') != '' }}
         env:
@@ -285,7 +272,6 @@ PY
           n=$(wc -l < work/redirect_findings.txt 2>/dev/null | tr -d ' ')
           echo "[+] Open redirect findings: $n"
 
-      # ---------- PHASE 7 ----------
       - name: Merge and dedupe findings
         run: |
           set -euo pipefail
@@ -309,7 +295,6 @@ PY
           echo "--- preview ---"
           head -30 work/ALL_FINDINGS.txt || true
 
-          # inventory of the four key files
           echo ""
           echo "=== KEY OUTPUT FILES ==="
           for f in WORKING_SUBS.txt PARAMETERS_WITH_XSS_POTENTIAL.txt PARAM_NAMES.txt CONFIRMED_XSS.txt; do
@@ -320,7 +305,6 @@ PY
             fi
           done
 
-      # ---------- outputs ----------
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -332,7 +316,6 @@ PY
           retention-days: 30
           if-no-files-found: warn
 
-      # ---------- Telegram ----------
       - name: Notify Telegram
         if: always()
         env:
@@ -350,9 +333,8 @@ PY
 
           MSG="$RUNNER_TEMP/tg.txt"
 
-          subs=0; live=0; work_subs=0; param_urls=0; xss=0; redir=0
+          subs=0; work_subs=0; param_urls=0; xss=0; redir=0
           [ -f work/subs.txt ]                           && subs=$(wc -l < work/subs.txt | tr -d ' ')
-          [ -f work/live_hosts.txt ]                     && live=$(wc -l < work/live_hosts.txt | tr -d ' ')
           [ -f work/WORKING_SUBS.txt ]                   && work_subs=$(wc -l < work/WORKING_SUBS.txt | tr -d ' ')
           [ -f work/PARAMETERS_WITH_XSS_POTENTIAL.txt ]  && param_urls=$(wc -l < work/PARAMETERS_WITH_XSS_POTENTIAL.txt | tr -d ' ')
           [ -f work/CONFIRMED_XSS.txt ]                  && xss=$(wc -l < work/CONFIRMED_XSS.txt | tr -d ' ')
@@ -408,7 +390,6 @@ PY
             -d "disable_web_page_preview=true" \
             --max-time 30 || echo "[!] Telegram send failed (continuing)"
 
-      # ---------- GitHub summary ----------
       - name: Write summary
         if: always()
         shell: bash
