@@ -20,20 +20,10 @@ usage () {
   cat <<EOF
 Usage:
   $0 -d <target.com> -w <dns-wordlist.txt> -r <resolvers.txt> [options]
-
-Required:
-  -d  <domain>         Root domain to enumerate
-  -w  <file>           DNS brute-force wordlist
-  -r  <file>           Resolver list file
-
 Options:
-  -o  <dir>            Output directory (default: ./subenum_out)
-  -t  <n>              Concurrent threads for active steps (default: 20)
-  -R  <n>              Requests per second cap (default: 20)
   --mode <m>           passive | active | full  (default: active)
   --depth <n>          Recursion depth for permutation (0=off, 1-3)
   --perm <file>        Permutation wordlist for recursion
-  -h, --help           Show this help
 EOF
 }
 
@@ -54,34 +44,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -z "$TARGET" || -z "$WORDLIST" || -z "$RESOLVERS" ]] && { usage; exit 1; }
-[[ ! -r "$WORDLIST" ]] && { echo "[-] cannot read wordlist: $WORDLIST"; exit 1; }
 
-if [[ ! -r "$RESOLVERS" ]]; then
-  echo "[-] cannot read resolvers file: $RESOLVERS"
-  echo "    Note: -r is the RESOLVERS FILE, not rate. Rate is -R."
-  echo "    Get one with:  puredns init"
-  exit 1
-fi
-
-case "$MODE" in
-  passive|active|full) ;;
-  *) echo "[-] --mode must be passive|active|full"; exit 1 ;;
-esac
-
-# ---------- dependency checks ----------
 for t in subfinder dnsx httpx puredns jq curl; do
   command -v "$t" >/dev/null || { echo "[-] missing required tool: $t"; exit 1; }
-done
-
-for t in amass assetfinder gotator dnsgen; do
-  command -v "$t" >/dev/null || echo "[!] optional tool missing: $t (some sources will be skipped)"
 done
 
 mkdir -p "$OUTDIR"
 TMP="$OUTDIR/.tmp"
 mkdir -p "$TMP"
 
-# ---------- helpers ----------
 dedupe () {
   if command -v anew >/dev/null 2>&1; then anew "$@"; else sort -u; fi
 }
@@ -119,9 +90,10 @@ curl -s "https://crt.sh/?q=%25.$TARGET&output=json" \
   | grep -oE "[A-Za-z0-9._-]+\.${TARGET}" \
   | sort -u > "$TMP/sub_crt.txt" 2>/dev/null || true
 
-cat "$TMP"/sub_*.txt 2>/dev/null \
+# FIX: Use find to avoid crashing if no files exist
+find "$TMP" -maxdepth 1 -name 'sub_*.txt' -exec cat {} + 2>/dev/null \
   | sed '/^$/d' \
-  | dedupe "$OUTDIR/passive_subs.txt"
+  | dedupe "$OUTDIR/passive_subs.txt" || touch "$OUTDIR/passive_subs.txt"
 
 echo "[+] Passive: $(wc -l < "$OUTDIR/passive_subs.txt" | tr -d ' ') candidates"
 
@@ -135,9 +107,10 @@ if [[ "$MODE" != "passive" ]]; then
     -t "$THREADS" \
     -o "$TMP/sub_bruteforce.txt" 2>/dev/null || true
 
-  cat "$OUTDIR/passive_subs.txt" "$TMP/sub_bruteforce.txt" 2>/dev/null \
+  # FIX: Use find to avoid crashing if puredns failed
+  find "$OUTDIR/passive_subs.txt" "$TMP/sub_bruteforce.txt" -type f -exec cat {} + 2>/dev/null \
     | sed '/^$/d' \
-    | dedupe "$OUTDIR/all_subs_raw.txt"
+    | dedupe "$OUTDIR/all_subs_raw.txt" || touch "$OUTDIR/all_subs_raw.txt"
 fi
 
 echo "[+] Raw merged: $(wc -l < "$OUTDIR/all_subs_raw.txt" | tr -d ' ') candidates"
@@ -157,17 +130,15 @@ fi
 
 sed -E 's/[[:space:]].*$//' "$TMP/resolved.txt" 2>/dev/null \
   | sed '/^$/d' \
-  | dedupe "$OUTDIR/resolved_subs.txt"
+  | dedupe "$OUTDIR/resolved_subs.txt" || touch "$OUTDIR/resolved_subs.txt"
 
 echo "[+] Resolved: $(wc -l < "$OUTDIR/resolved_subs.txt" | tr -d ' ') live subdomains"
 
-# ---------- Phase 4: Recursion (only mode=full + depth>0) ----------
+# ---------- Phase 4: Recursion ----------
 if [[ "$MODE" == "full" && "$RECURSION_DEPTH" -gt 0 ]]; then
   echo "[*] Phase 4: Recursion (depth=$RECURSION_DEPTH)"
 
-  if [[ -z "$PERM_WORDLIST" || ! -r "$PERM_WORDLIST" ]]; then
-    echo "[-] --perm wordlist required for recursion. Skipping."
-  else
+  if [[ -n "$PERM_WORDLIST" && -r "$PERM_WORDLIST" ]]; then
     if command -v gotator >/dev/null 2>&1; then
       gotator -sub "$OUTDIR/resolved_subs.txt" -perm "$PERM_WORDLIST" -depth "$RECURSION_DEPTH" -numbers 10 \
         > "$TMP/permuted_candidates.txt" 2>/dev/null || true
@@ -185,10 +156,10 @@ if [[ "$MODE" == "full" && "$RECURSION_DEPTH" -gt 0 ]]; then
       rate_guard "$RATE" puredns resolve "$TMP/permuted_candidates.txt" -r "$RESOLVERS" -t "$THREADS" -o "$TMP/permuted_resolved.txt" 2>/dev/null || true
 
       if [[ -s "$TMP/permuted_resolved.txt" ]]; then
-        cat "$OUTDIR/resolved_subs.txt" "$TMP/permuted_resolved.txt" \
+        find "$OUTDIR/resolved_subs.txt" "$TMP/permuted_resolved.txt" -type f -exec cat {} + 2>/dev/null \
           | sed '/^$/d' \
-          | dedupe "$TMP/resolved_with_recursion.txt"
-        mv "$TMP/resolved_with_recursion.txt" "$OUTDIR/resolved_subs.txt"
+          | dedupe "$TMP/resolved_with_recursion.txt" || true
+        mv "$TMP/resolved_with_recursion.txt" "$OUTDIR/resolved_subs.txt" 2>/dev/null || true
         echo "[+] Recursion added $(wc -l < "$TMP/permuted_resolved.txt" | tr -d ' ') hosts"
       fi
     fi
@@ -204,5 +175,4 @@ httpx -l "$OUTDIR/resolved_subs.txt" \
   -t "$THREADS" -rl "$RATE" -timeout 10 \
   -o "$OUTDIR/live_hosts.txt" 2>/dev/null || true
 
-echo "[+] Live HTTP hosts: $(wc -l < "$OUTDIR/live_hosts.txt" | tr -d ' ')"
-echo "[+] Final output   : $OUTDIR/live_hosts.txt"
+echo "[
