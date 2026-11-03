@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       targets:
-        description: 'Target(s) — comma or newline separated'
+        description: 'Target(s) — comma or newline separated (e.g. api.example.com,dev.example.com)'
         required: true
         type: string
       wordlist:
@@ -14,7 +14,7 @@ on:
         default: 'quick'
         options: [quick, standard, deep, custom]
       custom_wordlist:
-        description: 'Custom wordlist URL (only when wordlist=custom)'
+        description: 'Custom wordlist URL (only used when wordlist=custom)'
         required: false
         type: string
         default: ''
@@ -59,15 +59,14 @@ jobs:
 
       - name: Verify scripts exist
         run: |
-          test -f fuzzall.sh                 || { echo "❌ fuzzall.sh missing"; exit 1; }
-          test -f .github/scripts/telegram.sh || { echo "❌ telegram.sh missing"; exit 1; }
-          echo "✅ scripts present"
+          test -f fuzzall.sh || { echo "❌ fuzzall.sh missing"; exit 1; }
+          echo "✅ fuzzall.sh present"
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-          cache: true
+          cache: false
 
       - name: Install base packages
         run: |
@@ -115,6 +114,10 @@ jobs:
         env:
           TARGETS: ${{ inputs.targets }}
         run: |
+          if [ -z "$TARGETS" ]; then
+            echo "❌ Error: The 'targets' input cannot be empty. Please provide at least one domain."
+            exit 1
+          fi
           mkdir -p work
           printf '%s' "$TARGETS" | tr ',' '\n' \
             | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d' \
@@ -161,7 +164,6 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      # ---------- Telegram notify ----------
       - name: Notify Telegram
         if: always()
         env:
@@ -173,11 +175,12 @@ jobs:
           RECURSION:          ${{ inputs.recursion }}
           JOB_STATUS:         ${{ job.status }}
         run: |
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "[!] Telegram secrets not configured — skipping"; exit 0
+          fi
           MSG="$RUNNER_TEMP/tg.txt"
-
           total=0
           [ -f fuzz_out/ALL_UNIQUE_URLS.txt ] && total=$(wc -l < fuzz_out/ALL_UNIQUE_URLS.txt | tr -d ' ')
-
           {
             echo "📂 DIR FUZZ — ${JOB_STATUS}"
             echo "Targets: ${TARGET_COUNT}"
@@ -186,32 +189,29 @@ jobs:
             echo "📊 Results"
             echo "• Unique URLs: ${total}"
             echo ""
-
-            # per-target counts
-            if compgen -G "fuzz_out/*.urls.txt" >/dev/null; then
-              echo "📁 Per-target:"
-              for f in fuzz_out/*.urls.txt; do
-                n=$(wc -l < "$f" | tr -d ' ')
-                name=$(basename "$f" .urls.txt)
-                echo "  ${name}: ${n}"
-              done
-              echo ""
-            fi
-
             if [ "$total" -gt 0 ]; then
               echo "🎯 Top URLs:"
               head -20 fuzz_out/ALL_UNIQUE_URLS.txt | sed 's/^/  /'
               [ "$total" -gt 20 ] && echo "  ... +$((total - 20)) more"
               echo ""
             fi
-
             echo "🔗 ${RUN_URL}"
           } > "$MSG"
-
-          bash .github/scripts/telegram.sh -f "$MSG"
+          if [ "$(wc -c < "$MSG")" -gt 4000 ]; then
+            head -c 3900 "$MSG" > "${MSG}.t"
+            printf '\n\n... [truncated]\n' >> "${MSG}.t"
+            mv "${MSG}.t" "$MSG"
+          fi
+          curl -sS -o /dev/null -w '[+] Telegram: HTTP %{http_code}\n' \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text@${MSG}" \
+            -d "disable_web_page_preview=true" \
+            --max-time 30 || echo "[!] Telegram send failed (continuing)"
 
       - name: Summary
         if: always()
+        shell: bash
         run: |
           {
             echo "## Directory Fuzz"
@@ -224,5 +224,11 @@ jobs:
               n=$(wc -l < fuzz_out/ALL_UNIQUE_URLS.txt | tr -d ' ')
               echo "### ✅ Unique URLs: $n"
               echo '```'; head -100 fuzz_out/ALL_UNIQUE_URLS.txt; echo '```'
+            else
+              echo "### ⚠️ No results — \`fuzz_out/ALL_UNIQUE_URLS.txt\` not produced"
+              echo '```'
+              ls -la fuzz_out/ 2>/dev/null || echo "directory does not exist"
+              echo '```'
             fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          } >> "$GITHUB_STEP_SUMMARY" || true
+        continue-on-error: true
