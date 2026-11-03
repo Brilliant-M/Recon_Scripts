@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       urls:
-        description: 'URLs to triage (newline or comma separated, optional if source_run_id set)'
+        description: 'URLs to triage (comma, space, or newline separated)'
         required: false
         type: string
         default: ''
@@ -65,15 +65,14 @@ jobs:
 
       - name: Verify scripts exist
         run: |
-          test -f triage.sh                   || { echo "❌ triage.sh missing"; exit 1; }
-          test -f .github/scripts/telegram.sh || { echo "❌ telegram.sh missing"; exit 1; }
-          echo "✅ scripts present"
+          test -f triage.sh || { echo "❌ triage.sh missing"; exit 1; }
+          echo "✅ triage.sh present"
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-          cache: true
+          cache: false
 
       - name: Install jq + curl
         run: |
@@ -108,7 +107,8 @@ jobs:
           : > work/urls.txt
 
           if [ -n "$URLS" ]; then
-            printf '%s\n' "$URLS" | tr ',' '\n' \
+            # Replaces commas, spaces, and tabs with newlines
+            echo "$URLS" | tr -s ' ,\t' '\n' \
               | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d' \
               >> work/urls.txt
           fi
@@ -175,7 +175,7 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      # ---------- Telegram notify ----------
+      # ---------- Telegram notify (inlined) ----------
       - name: Notify Telegram
         if: always()
         env:
@@ -185,6 +185,9 @@ jobs:
           MIN_SCORE:          ${{ inputs.min_score }}
           JOB_STATUS:         ${{ job.status }}
         run: |
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "[!] Telegram secrets not configured — skipping"; exit 0
+          fi
           MSG="$RUNNER_TEMP/tg.txt"
 
           input=0; short=0; bypass=0; err=0; direct=0; cfg=0
@@ -217,10 +220,22 @@ jobs:
             echo "🔗 ${RUN_URL}"
           } > "$MSG"
 
-          bash .github/scripts/telegram.sh -f "$MSG"
+          if [ "$(wc -c < "$MSG")" -gt 4000 ]; then
+            head -c 3900 "$MSG" > "${MSG}.t"
+            printf '\n\n... [truncated — see artifact]\n' >> "${MSG}.t"
+            mv "${MSG}.t" "$MSG"
+          fi
+
+          curl -sS -o /dev/null -w '[+] Telegram: HTTP %{http_code}\n' \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text@${MSG}" \
+            -d "disable_web_page_preview=true" \
+            --max-time 30 || echo "[!] Telegram send failed (continuing)"
 
       - name: Summary
         if: always()
+        shell: bash
         run: |
           {
             echo "## Triage"
@@ -228,14 +243,15 @@ jobs:
             echo "| Min score | \`${{ inputs.min_score }}\` |"
             echo "| Soft-404 | \`${{ inputs.soft404 }}\` |"
             echo ""
-            [ -f triage_out/summary.txt ] && {
+            if [ -f triage_out/summary.txt ]; then
               echo "### Summary"
               echo '```'; cat triage_out/summary.txt; echo '```'
-            }
-            [ -f triage_out/WORTH_TESTING.txt ] && {
+            fi
+            if [ -f triage_out/WORTH_TESTING.txt ]; then
               echo "### 🎯 Worth-testing (top 40)"
               echo '```'
               awk '!/^#/' triage_out/WORTH_TESTING.txt | head -40
               echo '```'
-            }
-          } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY" || true
+        continue-on-error: true
