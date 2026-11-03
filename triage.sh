@@ -21,20 +21,6 @@ usage () {
 Usage:
   $0 -l <urls.txt> [options]
   $0 -u <url> [options]
-
-Input:
-  -l <file>       URL list file (can repeat)
-  -u <url>        single URL
-
-Options:
-  -o <dir>        output dir (default: ./triage_out)
-  -t <n>          threads (default: 20)
-  -r <n>          requests/sec (default: 20)
-  -H <header>     custom header (repeatable)
-  -mc <codes>     match codes (default: 100-599)
-  --soft404 <0|1> soft-404 detection (default: 1)
-  --min-score <n> min score for shortlist (default: 3)
-  -h              show help
 EOF
 }
 
@@ -112,9 +98,10 @@ fi
 # ---------- Step 2: full httpx probe ----------
 echo "[*] httpx probe"
 
+# FIXED: Removed invalid `-method` flag. 
 httpx -l "$TMP/urls.clean.txt" \
   -sc -title -tech-detect -content-type -location \
-  -cl -wc -server -method \
+  -cl -wc -server \
   -mc "$MC" \
   -t "$THREADS" -rl "$RATE" -timeout 10 \
   -silent -json -o "$OUTDIR/raw.jsonl" \
