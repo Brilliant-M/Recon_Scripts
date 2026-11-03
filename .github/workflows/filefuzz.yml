@@ -116,7 +116,7 @@ jobs:
           case "${{ inputs.wordlist }}" in
             quick)    URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt" ;;
             standard) URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-large-files.txt" ;;
-            backups)  URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/BackupFiles.fuzz.txt" ;;
+            backups)  URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/Common-DB-Backups.txt" ;;
             custom)
               [ -z "${{ inputs.custom_wordlist }}" ] && { echo "❌ custom_wordlist URL required"; exit 1; }
               URL="${{ inputs.custom_wordlist }}"
@@ -138,7 +138,6 @@ jobs:
             exit 1
           fi
           mkdir -p work
-          # Replaces commas, spaces, and tabs with newlines
           echo "$TARGETS" | tr -s ' ,\t' '\n' \
             | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d' \
             > work/subs.txt
