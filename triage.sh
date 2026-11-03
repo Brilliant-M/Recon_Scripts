@@ -73,6 +73,9 @@ sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d' "$URLS" \
 
 TOTAL=$(wc -l < "$TMP/urls.clean.txt" | tr -d ' ')
 echo "[*] probing $TOTAL unique URLs (threads=$THREADS, rate=$RATE)"
+echo "--- URLs to test: ---"
+cat "$TMP/urls.clean.txt"
+echo "---------------------"
 
 # ---------- Step 1: baseline 404 per host ----------
 declare -A HOST_404_LEN=()
@@ -98,13 +101,13 @@ fi
 # ---------- Step 2: full httpx probe ----------
 echo "[*] httpx probe"
 
-# FIXED: Removed invalid `-method` flag. 
+# REMOVED -silent so errors print to the log
 httpx -l "$TMP/urls.clean.txt" \
   -sc -title -tech-detect -content-type -location \
   -cl -wc -server \
   -mc "$MC" \
   -t "$THREADS" -rl "$RATE" -timeout 10 \
-  -silent -json -o "$OUTDIR/raw.jsonl" \
+  -json -o "$OUTDIR/raw.jsonl" \
   "${HDR_ARGS[@]}" 2>&1 || true
 
 RAW="$OUTDIR/raw.jsonl"
