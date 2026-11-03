@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       targets:
-        description: 'Target(s) — comma or newline separated (e.g. api.example.com,dev.example.com)'
+        description: 'Target(s) — comma, space, or newline separated (e.g. api.example.com dev.example.com)'
         required: true
         type: string
       wordlist:
@@ -119,7 +119,8 @@ jobs:
             exit 1
           fi
           mkdir -p work
-          printf '%s' "$TARGETS" | tr ',' '\n' \
+          # Replaces commas, spaces, and tabs with newlines
+          echo "$TARGETS" | tr -s ' ,\t' '\n' \
             | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d' \
             > work/subs.txt
           n=$(wc -l < work/subs.txt | tr -d ' ')
