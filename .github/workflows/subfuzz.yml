@@ -52,9 +52,8 @@ jobs:
 
       - name: Verify scripts exist
         run: |
-          test -f subfuzz.sh               || { echo "❌ subfuzz.sh missing"; exit 1; }
-          test -f .github/scripts/telegram.sh || { echo "❌ telegram.sh missing"; exit 1; }
-          echo "✅ scripts present"
+          test -f subfuzz.sh || { echo "❌ subfuzz.sh missing"; exit 1; }
+          echo "✅ subfuzz.sh present"
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -149,7 +148,7 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      # ---------- Telegram notify ----------
+      # ---------- Telegram (inlined, no external file) ----------
       - name: Notify Telegram
         if: always()
         env:
@@ -161,6 +160,11 @@ jobs:
           DEPTH:              ${{ inputs.depth }}
           JOB_STATUS:         ${{ job.status }}
         run: |
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "[!] Telegram secrets not configured — skipping"
+            exit 0
+          fi
+
           MSG="$RUNNER_TEMP/tg.txt"
 
           passive=0; resolved=0; live=0
@@ -189,10 +193,23 @@ jobs:
             echo "🔗 ${RUN_URL}"
           } > "$MSG"
 
-          bash .github/scripts/telegram.sh -f "$MSG"
+          if [ "$(wc -c < "$MSG")" -gt 4000 ]; then
+            head -c 3900 "$MSG" > "${MSG}.t"
+            printf '\n\n... [truncated — see artifact]\n' >> "${MSG}.t"
+            mv "${MSG}.t" "$MSG"
+          fi
 
+          curl -sS -o /dev/null -w '[+] Telegram: HTTP %{http_code}\n' \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text@${MSG}" \
+            -d "disable_web_page_preview=true" \
+            --max-time 30 || echo "[!] Telegram send failed (continuing)"
+
+      # ---------- Summary (fixed, never fails on missing files) ----------
       - name: Write summary
         if: always()
+        shell: bash
         run: |
           {
             echo "## Subdomain Fuzz — \`${{ inputs.target }}\`"
@@ -204,12 +221,35 @@ jobs:
             echo "| Threads | \`${{ inputs.threads }}\` |"
             echo "| Rate | \`${{ inputs.rate }}\` req/s |"
             echo ""
-            [ -f subenum_out/live_hosts.txt ] && {
+
+            found=0
+            if [ -f subenum_out/live_hosts.txt ]; then
+              found=1
               echo "### ✅ Live hosts ($(wc -l < subenum_out/live_hosts.txt))"
-              echo '```'; head -50 subenum_out/live_hosts.txt; echo '```'
-            }
-            [ -f subenum_out/resolved_subs.txt ] && {
+              echo '```'
+              head -50 subenum_out/live_hosts.txt
+              echo '```'
+              echo ""
+            fi
+
+            if [ -f subenum_out/resolved_subs.txt ]; then
+              found=1
               echo "### 🔎 Resolved ($(wc -l < subenum_out/resolved_subs.txt))"
-              echo '```'; head -50 subenum_out/resolved_subs.txt; echo '```'
-            }
-          } >> "$GITHUB_STEP_SUMMARY"
+              echo '```'
+              head -50 subenum_out/resolved_subs.txt
+              echo '```'
+              echo ""
+            fi
+
+            if [ "$found" -eq 0 ]; then
+              echo "### ⚠️ No results produced"
+              echo ""
+              echo "Check the **Run enumeration** step — it likely failed or produced no output."
+              echo ""
+              echo "Contents of \`subenum_out/\`:"
+              echo '```'
+              ls -la subenum_out/ 2>/dev/null || echo "directory does not exist"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY" || true
+        continue-on-error: true
