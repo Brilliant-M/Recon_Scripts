@@ -12,10 +12,7 @@ on:
         required: true
         type: choice
         default: 'active'
-        options:
-          - passive
-          - active
-          - full
+        options: [passive, active, full]
       depth:
         description: 'Recursion depth (0 = off, only used when mode=full)'
         required: true
@@ -59,12 +56,17 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-          cache: true
+          cache: false
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
+      - name: Install base packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq curl dnsutils
 
       - name: Install massdns
         run: |
@@ -126,6 +128,10 @@ jobs:
           RATE:    ${{ inputs.rate }}
         run: |
           set -euo pipefail
+          if [ -z "$TARGET" ]; then
+            echo "❌ Error: The 'target' input cannot be empty."
+            exit 1
+          fi
           [[ "$TARGET" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]] || { echo "invalid domain: $TARGET"; exit 1; }
 
           ARGS=(-d "$TARGET" -w wordlists/subdomains.txt -r resolvers.txt -t "$THREADS" -R "$RATE")
@@ -148,7 +154,6 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      # ---------- Telegram (inlined, no external file) ----------
       - name: Notify Telegram
         if: always()
         env:
@@ -164,14 +169,11 @@ jobs:
             echo "[!] Telegram secrets not configured — skipping"
             exit 0
           fi
-
           MSG="$RUNNER_TEMP/tg.txt"
-
           passive=0; resolved=0; live=0
           [ -f subenum_out/passive_subs.txt ]  && passive=$(wc -l < subenum_out/passive_subs.txt  | tr -d ' ')
           [ -f subenum_out/resolved_subs.txt ] && resolved=$(wc -l < subenum_out/resolved_subs.txt | tr -d ' ')
           [ -f subenum_out/live_hosts.txt ]    && live=$(wc -l < subenum_out/live_hosts.txt    | tr -d ' ')
-
           {
             echo "🔍 SUBFUZZ — ${JOB_STATUS}"
             echo "Target: ${TARGET}"
@@ -182,23 +184,19 @@ jobs:
             echo "• Resolved:           ${resolved}"
             echo "• Live HTTP hosts:    ${live}"
             echo ""
-
             if [ "$live" -gt 0 ]; then
               echo "🌐 Top live hosts:"
               head -15 subenum_out/live_hosts.txt | sed 's/^/  /'
               [ "$live" -gt 15 ] && echo "  ... +$((live - 15)) more"
               echo ""
             fi
-
             echo "🔗 ${RUN_URL}"
           } > "$MSG"
-
           if [ "$(wc -c < "$MSG")" -gt 4000 ]; then
             head -c 3900 "$MSG" > "${MSG}.t"
-            printf '\n\n... [truncated — see artifact]\n' >> "${MSG}.t"
+            printf '\n\n... [truncated]\n' >> "${MSG}.t"
             mv "${MSG}.t" "$MSG"
           fi
-
           curl -sS -o /dev/null -w '[+] Telegram: HTTP %{http_code}\n' \
             -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
@@ -206,7 +204,6 @@ jobs:
             -d "disable_web_page_preview=true" \
             --max-time 30 || echo "[!] Telegram send failed (continuing)"
 
-      # ---------- Summary (fixed, never fails on missing files) ----------
       - name: Write summary
         if: always()
         shell: bash
@@ -221,7 +218,6 @@ jobs:
             echo "| Threads | \`${{ inputs.threads }}\` |"
             echo "| Rate | \`${{ inputs.rate }}\` req/s |"
             echo ""
-
             found=0
             if [ -f subenum_out/live_hosts.txt ]; then
               found=1
@@ -231,7 +227,6 @@ jobs:
               echo '```'
               echo ""
             fi
-
             if [ -f subenum_out/resolved_subs.txt ]; then
               found=1
               echo "### 🔎 Resolved ($(wc -l < subenum_out/resolved_subs.txt))"
@@ -240,7 +235,6 @@ jobs:
               echo '```'
               echo ""
             fi
-
             if [ "$found" -eq 0 ]; then
               echo "### ⚠️ No results produced"
               echo ""
