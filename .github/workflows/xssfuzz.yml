@@ -1,0 +1,407 @@
+name: XSS & Open Redirect Fuzz
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Root domain (e.g. example.com)'
+        required: true
+        type: string
+      mode:
+        description: 'Scan mode'
+        required: true
+        type: choice
+        default: 'active'
+        options:
+          - passive    # subfinder + historical URLs only, no crawling
+          - active     # subfinder + httpx + katana crawl + historical URLs
+      threads:
+        description: 'Concurrency for httpx/katana (default 10)'
+        required: false
+        type: string
+        default: '10'
+      rate:
+        description: 'Max requests/sec for httpx/katana (default 20)'
+        required: false
+        type: string
+        default: '20'
+      dalfox_delay:
+        description: 'Dalfox delay between requests in ms (default 200)'
+        required: false
+        type: string
+        default: '200'
+
+concurrency:
+  group: xssfuzz-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  xss:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      # ---------- install core tools ----------
+      - name: Install Go tools
+        run: |
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install github.com/projectdiscovery/katana/cmd/katana@latest
+          go install github.com/tomnomnom/gf@latest
+          go install github.com/tomnomnom/waybackurls@latest
+          go install github.com/lc/gau/v2/cmd/gau@latest
+          go install github.com/tomnomnom/qsreplace@latest
+          go install github.com/hahwul/dalfox/v2@latest
+          go install github.com/tomnomnom/anew@latest
+          go install github.com/owasp-amass/amass/v4/...@master || echo "amass optional, skipping"
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+          # verify
+          dalfox version
+          subfinder -version
+          httpx -version
+
+      - name: Install Python tools (uro, dnsgen)
+        run: |
+          pip3 install --quiet uro dnsgen
+
+      # ---------- gf patterns + wordlists ----------
+      - name: Download gf patterns
+        run: |
+          git clone --depth 1 https://github.com/1ndianl33t/Gf-Patterns.git /tmp/gf-patterns
+          mkdir -p "$HOME/.gf"
+          cp /tmp/gf-patterns/*.json "$HOME/.gf/" || true
+          # fallback: official gf patterns
+          if [ ! -f "$HOME/.gf/xss.json" ]; then
+            git clone --depth 1 https://github.com/tomnomnom/gf.git /tmp/gf
+            cp /tmp/gf/examples/*.json "$HOME/.gf/" || true
+          fi
+          ls "$HOME/.gf/" | head -20
+          test -f "$HOME/.gf/xss.json" || { echo "❌ xss.json pattern missing"; exit 1; }
+          echo "✅ gf patterns ready"
+
+      - name: Download XSS wordlist
+        run: |
+          mkdir -p wordlists
+          curl -fsSL \
+            https://raw.githubusercontent.com/danielmiessler/SecLists/master/Fuzzing/XSS/XSS-Jhaddix.txt \
+            -o wordlists/xss.txt
+          wc -l wordlists/xss.txt
+          test -s wordlists/xss.txt
+
+      # ---------- PHASE 1: subdomain enumeration ----------
+      - name: Enumerate subdomains
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          echo "[*] Passive subdomain enumeration for $TARGET"
+          subfinder -d "$TARGET" -all -silent -o work/subs.txt || true
+          # fallback to crt.sh if subfinder yields nothing
+          if [ ! -s work/subs.txt ]; then
+            echo "[!] subfinder empty, falling back to crt.sh"
+            curl -s "https://crt.sh/?q=%25.$TARGET&output=json" \
+              | jq -r '.[].name_value' \
+              | sed 's/\*\.//g' | tr ',' '\n' \
+              | grep -oE "[A-Za-z0-9._-]+\.${TARGET}" \
+              | sort -u > work/subs.txt || true
+          fi
+          sort -u work/subs.txt -o work/subs.txt
+          n=$(wc -l < work/subs.txt | tr -d ' ')
+          echo "[+] Subdomains: $n"
+          test "$n" -gt 0 || { echo "❌ No subdomains found"; exit 1; }
+
+      # ---------- PHASE 2: live host probing ----------
+      - name: Probe live hosts
+        env:
+          THREADS: ${{ inputs.threads }}
+          RATE: ${{ inputs.rate }}
+        run: |
+          set -euo pipefail
+          echo "[*] Probing live hosts with httpx"
+          httpx -l work/subs.txt \
+            -ports 80,443,8080,8443 \
+            -sc -title -tech-detect -cdn -silent \
+            -t "$THREADS" -rl "$RATE" -timeout 10 \
+            -o work/live_hosts.txt || true
+          n=$(wc -l < work/live_hosts.txt 2>/dev/null | tr -d ' ')
+          echo "[+] Live hosts: $n"
+          test "$n" -gt 0 || { echo "❌ No live hosts"; exit 1; }
+
+      # ---------- PHASE 3: URL collection (crawl + historical) ----------
+      - name: Collect URLs (katana + gau + waybackurls)
+        env:
+          TARGET: ${{ inputs.target }}
+          THREADS: ${{ inputs.threads }}
+          RATE: ${{ inputs.rate }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+
+          # 3a. historical URLs (passive)
+          echo "[*] Historical URLs (gau + waybackurls)"
+          gau --subs "$TARGET" --threads "$THREADS" 2>/dev/null > work/historical.txt || true
+          waybackurls "$TARGET" 2>/dev/null >> work/historical.txt || true
+          sort -u work/historical.txt -o work/historical.txt || true
+          echo "[+] Historical URLs: $(wc -l < work/historical.txt | tr -d ' ')"
+
+          # 3b. active crawl (only in active mode)
+          if [ "$MODE" = "active" ]; then
+            echo "[*] Active crawl with katana"
+            katana -list work/live_hosts.txt \
+              -d 3 -jc -kf all -fx \
+              -c "$THREADS" -p "$THREADS" \
+              -rl "$RATE" \
+              -silent -o work/crawled.txt 2>/dev/null || true
+            echo "[+] Crawled URLs: $(wc -l < work/crawled.txt 2>/dev/null | tr -d ' ')"
+          else
+            : > work/crawled.txt
+          fi
+
+          # 3c. merge all URLs
+          cat work/historical.txt work/crawled.txt 2>/dev/null \
+            | sed '/^$/d' \
+            | uro \
+            | sort -u > work/all_urls.txt || true
+          echo "[+] Merged unique URLs: $(wc -l < work/all_urls.txt | tr -d ' ')"
+
+      # ---------- PHASE 4: parameter filtering (gf xss / redirect) ----------
+      - name: Filter XSS and redirect candidates
+        run: |
+          set -euo pipefail
+          mkdir -p work
+
+          # 4a. XSS candidates: URLs with parameters that look XSS-prone
+          cat work/all_urls.txt | gf xss > work/xss_candidates.txt 2>/dev/null || true
+          echo "[+] XSS candidate URLs: $(wc -l < work/xss_candidates.txt | tr -d ' ')"
+
+          # 4b. Open redirect candidates: URLs with redirect-style parameters
+          cat work/all_urls.txt | gf redirect > work/redirect_candidates.txt 2>/dev/null || true
+          echo "[+] Redirect candidate URLs: $(wc -l < work/redirect_candidates.txt | tr -d ' ')"
+
+          # show a few for sanity
+          echo "--- XSS candidates (first 5) ---"
+          head -5 work/xss_candidates.txt || true
+          echo "--- Redirect candidates (first 5) ---"
+          head -5 work/redirect_candidates.txt || true
+
+      # ---------- PHASE 5: XSS scan with Dalfox ----------
+      - name: Run Dalfox XSS scan
+        if: ${{ hashFiles('work/xss_candidates.txt') != '' }}
+        env:
+          DALFOX_DELAY: ${{ inputs.dalfox_delay }}
+        run: |
+          set -euo pipefail
+          echo "[*] Running Dalfox on $(wc -l < work/xss_candidates.txt | tr -d ' ') URLs"
+
+          # Use the official Dalfox action for clean reporting
+          # (also supports --follow-redirects and JSON output)
+          cat work/xss_candidates.txt | \
+            dalfox pipe \
+              --silence \
+              --delay "$DALFOX_DELAY" \
+              --follow-redirects \
+              --format json \
+              --report \
+              -o work/xss_results.json || true
+
+          # extract human-readable lines if JSON produced
+          if [ -s work/xss_results.json ]; then
+            jq -r '
+              if type == "array" then .[] | "\(.type) \(.method) \(.url) param=\(.param) payload=\(.payload)"
+              else "\(.type) \(.method) \(.url) param=\(.param) payload=\(.payload)"
+              end
+            ' work/xss_results.json > work/xss_findings.txt 2>/dev/null || true
+          fi
+          echo "[+] XSS findings: $(wc -l < work/xss_findings.txt 2>/dev/null | tr -d ' ')"
+
+      # ---------- PHASE 6: open redirect check ----------
+      - name: Test open redirects
+        if: ${{ hashFiles('work/redirect_candidates.txt') != '' }}
+        env:
+          RATE: ${{ inputs.rate }}
+        run: |
+          set -euo pipefail
+          echo "[*] Testing $(wc -l < work/redirect_candidates.txt | tr -d ' ') redirect candidates"
+          : > work/redirect_findings.txt
+
+          # Test each candidate by injecting https://evil.com into every parameter
+          while IFS= read -r url; do
+            [[ -z "$url" ]] && continue
+            # replace every parameter value with evil.com
+            testurl=$(printf '%s' "$url" | qsreplace 'https://evil.com' 2>/dev/null || echo "$url")
+            # follow redirects and capture the final Location
+            final=$(curl -sk -o /dev/null -w '%{redirect_url}' --max-time 8 -L "$testurl" 2>/dev/null || true)
+            if echo "$final" | grep -qi 'evil\.com'; then
+              echo "[OPEN-REDIRECT] $url  ->  $final" | tee -a work/redirect_findings.txt
+            fi
+            sleep 0.1   # tiny rate-limit
+          done < work/redirect_candidates.txt
+
+          n=$(wc -l < work/redirect_findings.txt 2>/dev/null | tr -d ' ')
+          echo "[+] Open redirect findings: $n"
+
+      # ---------- PHASE 7: merge results ----------
+      - name: Merge and dedupe findings
+        run: |
+          set -euo pipefail
+          : > work/ALL_FINDINGS.txt
+
+          if [ -f work/xss_findings.txt ]; then
+            echo "=== XSS ===" >> work/ALL_FINDINGS.txt
+            cat work/xss_findings.txt >> work/ALL_FINDINGS.txt
+          fi
+
+          if [ -f work/redirect_findings.txt ]; then
+            echo "" >> work/ALL_FINDINGS.txt
+            echo "=== OPEN REDIRECTS ===" >> work/ALL_FINDINGS.txt
+            cat work/redirect_findings.txt >> work/ALL_FINDINGS.txt
+          fi
+
+          echo "[+] Total findings: $(grep -cE '^\[|^===|^[A-Z]' work/ALL_FINDINGS.txt 2>/dev/null || echo 0)"
+          echo "--- preview ---"
+          head -30 work/ALL_FINDINGS.txt || true
+
+      # ---------- outputs ----------
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xssfuzz-${{ inputs.target }}-${{ github.run_id }}
+          path: |
+            work/
+            wordlists/
+          retention-days: 30
+          if-no-files-found: warn
+
+      # ---------- Telegram notify (inlined) ----------
+      - name: Notify Telegram
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL:            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TARGET:             ${{ inputs.target }}
+          MODE:               ${{ inputs.mode }}
+          JOB_STATUS:         ${{ job.status }}
+        run: |
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "[!] Telegram secrets not configured — skipping"
+            exit 0
+          fi
+
+          MSG="$RUNNER_TEMP/tg.txt"
+
+          subs=0; live=0; xss=0; redir=0
+          [ -f work/subs.txt ]            && subs=$(wc -l < work/subs.txt | tr -d ' ')
+          [ -f work/live_hosts.txt ]      && live=$(wc -l < work/live_hosts.txt | tr -d ' ')
+          [ -f work/xss_findings.txt ]    && xss=$(wc -l < work/xss_findings.txt | tr -d ' ')
+          [ -f work/redirect_findings.txt ] && redir=$(wc -l < work/redirect_findings.txt | tr -d ' ')
+
+          {
+            echo "🎯 XSS FUZZ — ${JOB_STATUS}"
+            echo "Target: ${TARGET}"
+            echo "Mode:   ${MODE}"
+            echo ""
+            echo "📊 Results"
+            echo "• Subdomains:   ${subs}"
+            echo "• Live hosts:   ${live}"
+            echo "• XSS findings: ${xss}"
+            echo "• Open redirects: ${redir}"
+            echo ""
+
+            if [ "$xss" -gt 0 ] && [ -f work/xss_findings.txt ]; then
+              echo "💥 Top XSS:"
+              head -10 work/xss_findings.txt | sed 's/^/  /'
+              [ "$xss" -gt 10 ] && echo "  ... +$((xss - 10)) more"
+              echo ""
+            fi
+
+            if [ "$redir" -gt 0 ] && [ -f work/redirect_findings.txt ]; then
+              echo "🔀 Top open redirects:"
+              head -5 work/redirect_findings.txt | sed 's/^/  /'
+              [ "$redir" -gt 5 ] && echo "  ... +$((redir - 5)) more"
+              echo ""
+            fi
+
+            echo "🔗 ${RUN_URL}"
+          } > "$MSG"
+
+          if [ "$(wc -c < "$MSG")" -gt 4000 ]; then
+            head -c 3900 "$MSG" > "${MSG}.t"
+            printf '\n\n... [truncated — see artifact]\n' >> "${MSG}.t"
+            mv "${MSG}.t" "$MSG"
+          fi
+
+          curl -sS -o /dev/null -w '[+] Telegram: HTTP %{http_code}\n' \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text@${MSG}" \
+            -d "disable_web_page_preview=true" \
+            --max-time 30 || echo "[!] Telegram send failed (continuing)"
+
+      # ---------- GitHub job summary ----------
+      - name: Write summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## XSS & Open Redirect Fuzz — \`${{ inputs.target }}\`"
+            echo ""
+            echo "| Setting | Value |"
+            echo "|---|---|"
+            echo "| Mode | \`${{ inputs.mode }}\` |"
+            echo "| Threads | \`${{ inputs.threads }}\` |"
+            echo "| Rate | \`${{ inputs.rate }}\` req/s |"
+            echo "| Dalfox delay | \`${{ inputs.dalfox_delay }}\` ms |"
+            echo ""
+
+            found=0
+            if [ -f work/xss_findings.txt ] && [ -s work/xss_findings.txt ]; then
+              found=1
+              echo "### 💥 XSS Findings ($(wc -l < work/xss_findings.txt))"
+              echo '```'
+              head -50 work/xss_findings.txt
+              echo '```'
+              echo ""
+            fi
+
+            if [ -f work/redirect_findings.txt ] && [ -s work/redirect_findings.txt ]; then
+              found=1
+              echo "### 🔀 Open Redirect Findings ($(wc -l < work/redirect_findings.txt))"
+              echo '```'
+              head -50 work/redirect_findings.txt
+              echo '```'
+              echo ""
+            fi
+
+            if [ "$found" -eq 0 ]; then
+              echo "### ⚠️ No findings"
+              echo ""
+              echo "This can mean either:"
+              echo "- No XSS/open-redirect present (good for the target)"
+              echo "- Filtering was too aggressive — inspect \`work/all_urls.txt\` and \`work/xss_candidates.txt\`"
+              echo "- Dalfox did not scan because \`work/xss_candidates.txt\` was empty"
+              echo ""
+              echo "Artifact contents:"
+              echo '```'
+              ls -la work/ 2>/dev/null || echo "work/ missing"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY" || true
+        continue-on-error: true
