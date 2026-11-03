@@ -63,7 +63,7 @@ TMP="$OUTDIR/.tmp"
 mkdir -p "$TMP"
 
 HDR_ARGS=()
-for h in "${CUSTOM_HEADERS[@]:-}"; do
+for h in "${CUSTOM_HEADERS[@]}"; do
   [[ -n "$h" ]] && HDR_ARGS+=(-H "$h")
 done
 
@@ -71,7 +71,7 @@ done
 URLS="$TMP/all_urls.txt"
 : > "$URLS"
 
-for f in "${INPUTS[@]:-}"; do
+for f in "${INPUTS[@]}"; do
   [[ -z "$f" ]] && continue
   [[ ! -r "$f" ]] && { echo "[-] cannot read $f"; continue; }
   tr -d '\r' < "$f" >> "$URLS"
@@ -100,7 +100,7 @@ if [[ "$SOFT404_CHECK" -eq 1 ]]; then
     rand="nonexistent-$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
     probe_url="${base}/${rand}"
     clen=$(curl -sk -o /dev/null -w '%{size_download}' --max-time 8 \
-           "${HDR_ARGS[@]:-}" "$probe_url" 2>/dev/null || echo "")
+           "${HDR_ARGS[@]}" "$probe_url" 2>/dev/null || echo "")
     if [[ "$clen" =~ ^[0-9]+$ ]]; then
       HOST_404_LEN["$base"]="$clen"
       echo "    $base -> soft404 length $clen"
@@ -118,12 +118,18 @@ httpx -l "$TMP/urls.clean.txt" \
   -mc "$MC" \
   -t "$THREADS" -rl "$RATE" -timeout 10 \
   -silent -json -o "$OUTDIR/raw.jsonl" \
-  "${HDR_ARGS[@]:-}" 2>/dev/null || true
+  "${HDR_ARGS[@]}" 2>&1 || true
 
 RAW="$OUTDIR/raw.jsonl"
 if [[ ! -s "$RAW" ]]; then
-  echo "[-] httpx produced no output"
-  exit 1
+  echo "[-] httpx produced no output (0 live URLs found)"
+  echo "Triage summary — $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$OUTDIR/summary.txt"
+  echo "-------------------------------------------" >> "$OUTDIR/summary.txt"
+  echo "Input URLs       : $TOTAL" >> "$OUTDIR/summary.txt"
+  echo "Probed responses : 0" >> "$OUTDIR/summary.txt"
+  echo "Shortlist (>= $MIN_SCORE) : 0" >> "$OUTDIR/summary.txt"
+  touch "$OUTDIR/WORTH_TESTING.txt"
+  exit 0
 fi
 
 jq -r '
@@ -148,7 +154,6 @@ while IFS=$'\t' read -r url status clen ct title server tech loc; do
   score=0
   tags=""
 
-  # --- status scoring (FIXED) ---
   case "$status" in
     200)                 score=$((score+2)); tags="$tags,status200" ;;
     201)                 score=$((score+2)); tags="$tags,status201" ;;
