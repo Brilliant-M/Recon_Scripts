@@ -69,7 +69,6 @@ jobs:
           go install github.com/tomnomnom/anew@latest
           go install github.com/owasp-amass/amass/v4/...@master || echo "amass optional, skipping"
           echo "$HOME/go/bin" >> "$GITHUB_PATH"
-          # verify
           dalfox version
           subfinder -version
           httpx -version
@@ -84,7 +83,6 @@ jobs:
           git clone --depth 1 https://github.com/1ndianl33t/Gf-Patterns.git /tmp/gf-patterns
           mkdir -p "$HOME/.gf"
           cp /tmp/gf-patterns/*.json "$HOME/.gf/" || true
-          # fallback: official gf patterns
           if [ ! -f "$HOME/.gf/xss.json" ]; then
             git clone --depth 1 https://github.com/tomnomnom/gf.git /tmp/gf
             cp /tmp/gf/examples/*.json "$HOME/.gf/" || true
@@ -93,14 +91,26 @@ jobs:
           test -f "$HOME/.gf/xss.json" || { echo "❌ xss.json pattern missing"; exit 1; }
           echo "✅ gf patterns ready"
 
+      # ---------- FIXED: wordlist path + fallback ----------
       - name: Download XSS wordlist
         run: |
           mkdir -p wordlists
-          curl -fsSL \
-            https://raw.githubusercontent.com/danielmiessler/SecLists/master/Fuzzing/XSS/XSS-Jhaddix.txt \
-            -o wordlists/xss.txt
-          wc -l wordlists/xss.txt
+          primary="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Fuzzing/XSS/robot-friendly/XSS-Jhaddix.txt"
+          fallback="https://raw.githubusercontent.com/payloadbox/xss-payload-list/master/Intruder/xss-payload-list.txt"
+
+          if curl -fsSL "$primary" -o wordlists/xss.txt 2>/dev/null; then
+            echo "[+] Downloaded primary XSS wordlist (robot-friendly)"
+          elif curl -fsSL "$fallback" -o wordlists/xss.txt 2>/dev/null; then
+            echo "[!] Primary failed (404/moved) — using fallback wordlist"
+          else
+            echo "❌ Both XSS wordlist sources failed"
+            exit 1
+          fi
+
+          lines=$(wc -l < wordlists/xss.txt | tr -d ' ')
+          echo "[+] XSS wordlist: $lines entries"
           test -s wordlists/xss.txt
+          head -3 wordlists/xss.txt
 
       # ---------- PHASE 1: subdomain enumeration ----------
       - name: Enumerate subdomains
@@ -111,7 +121,6 @@ jobs:
           mkdir -p work
           echo "[*] Passive subdomain enumeration for $TARGET"
           subfinder -d "$TARGET" -all -silent -o work/subs.txt || true
-          # fallback to crt.sh if subfinder yields nothing
           if [ ! -s work/subs.txt ]; then
             echo "[!] subfinder empty, falling back to crt.sh"
             curl -s "https://crt.sh/?q=%25.$TARGET&output=json" \
@@ -142,7 +151,7 @@ jobs:
           echo "[+] Live hosts: $n"
           test "$n" -gt 0 || { echo "❌ No live hosts"; exit 1; }
 
-      # ---------- PHASE 3: URL collection (crawl + historical) ----------
+      # ---------- PHASE 3: URL collection ----------
       - name: Collect URLs (katana + gau + waybackurls)
         env:
           TARGET: ${{ inputs.target }}
@@ -153,14 +162,12 @@ jobs:
           set -euo pipefail
           mkdir -p work
 
-          # 3a. historical URLs (passive)
           echo "[*] Historical URLs (gau + waybackurls)"
           gau --subs "$TARGET" --threads "$THREADS" 2>/dev/null > work/historical.txt || true
           waybackurls "$TARGET" 2>/dev/null >> work/historical.txt || true
           sort -u work/historical.txt -o work/historical.txt || true
           echo "[+] Historical URLs: $(wc -l < work/historical.txt | tr -d ' ')"
 
-          # 3b. active crawl (only in active mode)
           if [ "$MODE" = "active" ]; then
             echo "[*] Active crawl with katana"
             katana -list work/live_hosts.txt \
@@ -173,28 +180,24 @@ jobs:
             : > work/crawled.txt
           fi
 
-          # 3c. merge all URLs
           cat work/historical.txt work/crawled.txt 2>/dev/null \
             | sed '/^$/d' \
             | uro \
             | sort -u > work/all_urls.txt || true
           echo "[+] Merged unique URLs: $(wc -l < work/all_urls.txt | tr -d ' ')"
 
-      # ---------- PHASE 4: parameter filtering (gf xss / redirect) ----------
+      # ---------- PHASE 4: parameter filtering ----------
       - name: Filter XSS and redirect candidates
         run: |
           set -euo pipefail
           mkdir -p work
 
-          # 4a. XSS candidates: URLs with parameters that look XSS-prone
           cat work/all_urls.txt | gf xss > work/xss_candidates.txt 2>/dev/null || true
           echo "[+] XSS candidate URLs: $(wc -l < work/xss_candidates.txt | tr -d ' ')"
 
-          # 4b. Open redirect candidates: URLs with redirect-style parameters
           cat work/all_urls.txt | gf redirect > work/redirect_candidates.txt 2>/dev/null || true
           echo "[+] Redirect candidate URLs: $(wc -l < work/redirect_candidates.txt | tr -d ' ')"
 
-          # show a few for sanity
           echo "--- XSS candidates (first 5) ---"
           head -5 work/xss_candidates.txt || true
           echo "--- Redirect candidates (first 5) ---"
@@ -209,22 +212,20 @@ jobs:
           set -euo pipefail
           echo "[*] Running Dalfox on $(wc -l < work/xss_candidates.txt | tr -d ' ') URLs"
 
-          # Use the official Dalfox action for clean reporting
-          # (also supports --follow-redirects and JSON output)
           cat work/xss_candidates.txt | \
             dalfox pipe \
               --silence \
               --delay "$DALFOX_DELAY" \
               --follow-redirects \
               --format json \
-              --report \
               -o work/xss_results.json || true
 
-          # extract human-readable lines if JSON produced
           if [ -s work/xss_results.json ]; then
             jq -r '
-              if type == "array" then .[] | "\(.type) \(.method) \(.url) param=\(.param) payload=\(.payload)"
-              else "\(.type) \(.method) \(.url) param=\(.param) payload=\(.payload)"
+              if type == "array" then
+                .[] | "\(.type) \(.method) \(.url) param=\(.param) payload=\(.payload)"
+              else
+                "\(.type) \(.method) \(.url) param=\(.param) payload=\(.payload)"
               end
             ' work/xss_results.json > work/xss_findings.txt 2>/dev/null || true
           fi
@@ -240,17 +241,14 @@ jobs:
           echo "[*] Testing $(wc -l < work/redirect_candidates.txt | tr -d ' ') redirect candidates"
           : > work/redirect_findings.txt
 
-          # Test each candidate by injecting https://evil.com into every parameter
           while IFS= read -r url; do
             [[ -z "$url" ]] && continue
-            # replace every parameter value with evil.com
             testurl=$(printf '%s' "$url" | qsreplace 'https://evil.com' 2>/dev/null || echo "$url")
-            # follow redirects and capture the final Location
             final=$(curl -sk -o /dev/null -w '%{redirect_url}' --max-time 8 -L "$testurl" 2>/dev/null || true)
             if echo "$final" | grep -qi 'evil\.com'; then
               echo "[OPEN-REDIRECT] $url  ->  $final" | tee -a work/redirect_findings.txt
             fi
-            sleep 0.1   # tiny rate-limit
+            sleep 0.1
           done < work/redirect_candidates.txt
 
           n=$(wc -l < work/redirect_findings.txt 2>/dev/null | tr -d ' ')
@@ -262,18 +260,17 @@ jobs:
           set -euo pipefail
           : > work/ALL_FINDINGS.txt
 
-          if [ -f work/xss_findings.txt ]; then
+          if [ -f work/xss_findings.txt ] && [ -s work/xss_findings.txt ]; then
             echo "=== XSS ===" >> work/ALL_FINDINGS.txt
             cat work/xss_findings.txt >> work/ALL_FINDINGS.txt
           fi
 
-          if [ -f work/redirect_findings.txt ]; then
+          if [ -f work/redirect_findings.txt ] && [ -s work/redirect_findings.txt ]; then
             echo "" >> work/ALL_FINDINGS.txt
             echo "=== OPEN REDIRECTS ===" >> work/ALL_FINDINGS.txt
             cat work/redirect_findings.txt >> work/ALL_FINDINGS.txt
           fi
 
-          echo "[+] Total findings: $(grep -cE '^\[|^===|^[A-Z]' work/ALL_FINDINGS.txt 2>/dev/null || echo 0)"
           echo "--- preview ---"
           head -30 work/ALL_FINDINGS.txt || true
 
@@ -308,9 +305,9 @@ jobs:
           MSG="$RUNNER_TEMP/tg.txt"
 
           subs=0; live=0; xss=0; redir=0
-          [ -f work/subs.txt ]            && subs=$(wc -l < work/subs.txt | tr -d ' ')
-          [ -f work/live_hosts.txt ]      && live=$(wc -l < work/live_hosts.txt | tr -d ' ')
-          [ -f work/xss_findings.txt ]    && xss=$(wc -l < work/xss_findings.txt | tr -d ' ')
+          [ -f work/subs.txt ]              && subs=$(wc -l < work/subs.txt | tr -d ' ')
+          [ -f work/live_hosts.txt ]        && live=$(wc -l < work/live_hosts.txt | tr -d ' ')
+          [ -f work/xss_findings.txt ]      && xss=$(wc -l < work/xss_findings.txt | tr -d ' ')
           [ -f work/redirect_findings.txt ] && redir=$(wc -l < work/redirect_findings.txt | tr -d ' ')
 
           {
@@ -319,9 +316,9 @@ jobs:
             echo "Mode:   ${MODE}"
             echo ""
             echo "📊 Results"
-            echo "• Subdomains:   ${subs}"
-            echo "• Live hosts:   ${live}"
-            echo "• XSS findings: ${xss}"
+            echo "• Subdomains:     ${subs}"
+            echo "• Live hosts:     ${live}"
+            echo "• XSS findings:   ${xss}"
             echo "• Open redirects: ${redir}"
             echo ""
 
@@ -393,7 +390,7 @@ jobs:
             if [ "$found" -eq 0 ]; then
               echo "### ⚠️ No findings"
               echo ""
-              echo "This can mean either:"
+              echo "Possible reasons:"
               echo "- No XSS/open-redirect present (good for the target)"
               echo "- Filtering was too aggressive — inspect \`work/all_urls.txt\` and \`work/xss_candidates.txt\`"
               echo "- Dalfox did not scan because \`work/xss_candidates.txt\` was empty"
