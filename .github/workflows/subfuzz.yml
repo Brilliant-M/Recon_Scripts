@@ -91,6 +91,22 @@ jobs:
       - name: Install dnsgen
         run: pip install --quiet dnsgen
 
+      # FIXED: Verify tools are installed before running the script
+      - name: Verify tools
+        run: |
+          export PATH="$PATH:$HOME/go/bin"
+          MISSING=""
+          for t in subfinder dnsx httpx puredns massdns jq curl; do
+            if ! command -v "$t" >/dev/null 2>&1; then
+              MISSING="$MISSING $t"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "❌ CRITICAL: Missing required tools:$MISSING"
+            exit 1
+          fi
+          echo "✅ All required tools are installed and in PATH."
+
       - name: Download wordlists
         run: |
           mkdir -p wordlists
@@ -128,6 +144,8 @@ jobs:
           RATE:    ${{ inputs.rate }}
         run: |
           set -euo pipefail
+          export PATH="$PATH:$HOME/go/bin"
+          
           if [ -z "$TARGET" ]; then
             echo "❌ Error: The 'target' input cannot be empty."
             exit 1
