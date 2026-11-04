@@ -45,9 +45,18 @@ done
 
 [[ -z "$TARGET" || -z "$WORDLIST" || -z "$RESOLVERS" ]] && { usage; exit 1; }
 
+# FIXED: List all missing tools instead of exiting on the first one
+missing=()
 for t in subfinder dnsx httpx puredns jq curl; do
-  command -v "$t" >/dev/null || { echo "[-] missing required tool: $t"; exit 1; }
+  if ! command -v "$t" >/dev/null 2>&1; then
+    missing+=("$t")
+  fi
 done
+
+if [[ ${#missing[@]} -gt 0 ]]; then
+  echo "❌ ERROR: The following required tools are missing: ${missing[*]}"
+  exit 1
+fi
 
 mkdir -p "$OUTDIR"
 TMP="$OUTDIR/.tmp"
@@ -90,7 +99,6 @@ curl -s "https://crt.sh/?q=%25.$TARGET&output=json" \
   | grep -oE "[A-Za-z0-9._-]+\.${TARGET}" \
   | sort -u > "$TMP/sub_crt.txt" 2>/dev/null || true
 
-# FIX: Use find to avoid crashing if no files exist
 find "$TMP" -maxdepth 1 -name 'sub_*.txt' -exec cat {} + 2>/dev/null \
   | sed '/^$/d' \
   | dedupe "$OUTDIR/passive_subs.txt" || touch "$OUTDIR/passive_subs.txt"
@@ -107,7 +115,6 @@ if [[ "$MODE" != "passive" ]]; then
     -t "$THREADS" \
     -o "$TMP/sub_bruteforce.txt" 2>/dev/null || true
 
-  # FIX: Use find to avoid crashing if puredns failed
   find "$OUTDIR/passive_subs.txt" "$TMP/sub_bruteforce.txt" -type f -exec cat {} + 2>/dev/null \
     | sed '/^$/d' \
     | dedupe "$OUTDIR/all_subs_raw.txt" || touch "$OUTDIR/all_subs_raw.txt"
@@ -175,4 +182,5 @@ httpx -l "$OUTDIR/resolved_subs.txt" \
   -t "$THREADS" -rl "$RATE" -timeout 10 \
   -o "$OUTDIR/live_hosts.txt" 2>/dev/null || true
 
-echo "[
+echo "[+] Live HTTP hosts: $(wc -l < "$OUTDIR/live_hosts.txt" | tr -d ' ')"
+echo "[+] Final output   : $OUTDIR/live_hosts.txt"
