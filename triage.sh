@@ -12,7 +12,7 @@ OUTDIR="./triage_out"
 THREADS=20
 RATE=20
 CUSTOM_HEADERS=()
-MC="100-599"
+MC="200,201,204,301,302,303,307,308,400,401,403,405,500,502,503"
 SOFT404_CHECK=1
 MIN_SCORE=3
 
@@ -42,7 +42,6 @@ done
 
 [[ ${#INPUTS[@]} -eq 0 && -z "$SINGLE" ]] && { usage; exit 1; }
 
-# Check for httpx-toolkit (Kali) or fallback to httpx (GitHub Actions)
 HTTPX_CMD=""
 if command -v httpx-toolkit >/dev/null 2>&1; then
   HTTPX_CMD="httpx-toolkit"
@@ -109,16 +108,11 @@ fi
 # ---------- Step 2: full httpx probe ----------
 echo "[*] Running $HTTPX_CMD probe"
 
-# DEBUGGING: Test the first URL manually to see if GitHub can reach it
 if [ -s "$TMP/urls.clean.txt" ]; then
   TEST_URL=$(head -n 1 "$TMP/urls.clean.txt")
   echo "[*] Connectivity test for: $TEST_URL"
   HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 10 "${HDR_ARGS[@]}" "$TEST_URL" || echo "000")
   echo "[*] Connection result: HTTP $HTTP_CODE"
-  
-  if [ "$HTTP_CODE" = "000" ]; then
-    echo "[-] WARNING: Could not connect to the target. It may be offline or blocking GitHub IPs."
-  fi
 fi
 
 $HTTPX_CMD -l "$TMP/urls.clean.txt" \
@@ -126,7 +120,7 @@ $HTTPX_CMD -l "$TMP/urls.clean.txt" \
   -cl -wc -server \
   -mc "$MC" \
   -t "$THREADS" -rl "$RATE" -timeout 10 \
-  -json -o "$OUTDIR/raw.jsonl" \
+  -silent -json -o "$OUTDIR/raw.jsonl" \
   "${HDR_ARGS[@]}" 2>&1 || true
 
 RAW="$OUTDIR/raw.jsonl"
@@ -207,7 +201,9 @@ while IFS=$'\t' read -r url status clen ct title server tech loc; do
     score=$((score+3)); tags="$tags,sensitive_file"
   fi
 
-  if [[ -n "$server" && ! "$server" =~ (nginx|apache|cloudflare|cloudfront|gws|Microsoft-IIS) ]]; then
+  # FIXED: Lowercase the server string so "CloudFront" matches "cloudfront"
+  lserver=$(echo "$server" | tr '[:upper:]' '[:lower:]')
+  if [[ -n "$lserver" && ! "$lserver" =~ (nginx|apache|cloudflare|cloudfront|gws|microsoft-iis) ]]; then
     score=$((score+1)); tags="$tags,unusual_server"
   fi
 
@@ -257,7 +253,8 @@ emit "tag_admin_like.txt"      "" "admin|dashboard|panel|console|manage"
 emit "tag_api_like.txt"        "" "api|graphql|swagger|docs"
 emit "tag_auth_like.txt"       "" "login|signin|auth"
 emit "tag_dev_like.txt"        "" "dev|staging|test|beta|internal|debug"
-emit "tag_config_backup.txt"   "" "sensitive_file|\.env|\.bak|\.git|\.svn"
+# FIXED: Removed backslashes to stop the awk warning
+emit "tag_config_backup.txt"   "" "sensitive_file|.env|.bak|.git|.svn"
 emit "tag_tech_known.txt"      "" "tech:"
 emit "tag_soft404.txt"         "" "soft404"
 
