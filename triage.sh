@@ -109,13 +109,24 @@ fi
 # ---------- Step 2: full httpx probe ----------
 echo "[*] Running $HTTPX_CMD probe"
 
-# Removed the invalid -method flag
+# DEBUGGING: Test the first URL manually to see if GitHub can reach it
+if [ -s "$TMP/urls.clean.txt" ]; then
+  TEST_URL=$(head -n 1 "$TMP/urls.clean.txt")
+  echo "[*] Connectivity test for: $TEST_URL"
+  HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 10 "${HDR_ARGS[@]}" "$TEST_URL" || echo "000")
+  echo "[*] Connection result: HTTP $HTTP_CODE"
+  
+  if [ "$HTTP_CODE" = "000" ]; then
+    echo "[-] WARNING: Could not connect to the target. It may be offline or blocking GitHub IPs."
+  fi
+fi
+
 $HTTPX_CMD -l "$TMP/urls.clean.txt" \
   -sc -title -tech-detect -content-type -location \
   -cl -wc -server \
   -mc "$MC" \
   -t "$THREADS" -rl "$RATE" -timeout 10 \
-  -silent -json -o "$OUTDIR/raw.jsonl" \
+  -json -o "$OUTDIR/raw.jsonl" \
   "${HDR_ARGS[@]}" 2>&1 || true
 
 RAW="$OUTDIR/raw.jsonl"
