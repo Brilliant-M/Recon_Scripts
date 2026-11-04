@@ -41,8 +41,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ ${#INPUTS[@]} -eq 0 && -z "$SINGLE" ]] && { usage; exit 1; }
-command -v httpx >/dev/null || { echo "[-] httpx not installed"; exit 1; }
-command -v jq    >/dev/null || { echo "[-] jq not installed";    exit 1; }
+
+# Check for httpx-toolkit (Kali) or fallback to httpx (GitHub Actions)
+HTTPX_CMD=""
+if command -v httpx-toolkit >/dev/null 2>&1; then
+  HTTPX_CMD="httpx-toolkit"
+elif command -v httpx >/dev/null 2>&1; then
+  HTTPX_CMD="httpx"
+else
+  echo "[-] httpx-toolkit (or httpx) not installed"
+  exit 1
+fi
+
+command -v jq >/dev/null || { echo "[-] jq not installed"; exit 1; }
 
 mkdir -p "$OUTDIR"
 TMP="$OUTDIR/.tmp"
@@ -73,9 +84,6 @@ sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d' "$URLS" \
 
 TOTAL=$(wc -l < "$TMP/urls.clean.txt" | tr -d ' ')
 echo "[*] probing $TOTAL unique URLs (threads=$THREADS, rate=$RATE)"
-echo "--- URLs to test: ---"
-cat "$TMP/urls.clean.txt"
-echo "---------------------"
 
 # ---------- Step 1: baseline 404 per host ----------
 declare -A HOST_404_LEN=()
@@ -99,20 +107,20 @@ if [[ "$SOFT404_CHECK" -eq 1 ]]; then
 fi
 
 # ---------- Step 2: full httpx probe ----------
-echo "[*] httpx probe"
+echo "[*] Running $HTTPX_CMD probe"
 
-# REMOVED -silent so errors print to the log
-httpx -l "$TMP/urls.clean.txt" \
+# Removed the invalid -method flag
+$HTTPX_CMD -l "$TMP/urls.clean.txt" \
   -sc -title -tech-detect -content-type -location \
   -cl -wc -server \
   -mc "$MC" \
   -t "$THREADS" -rl "$RATE" -timeout 10 \
-  -json -o "$OUTDIR/raw.jsonl" \
+  -silent -json -o "$OUTDIR/raw.jsonl" \
   "${HDR_ARGS[@]}" 2>&1 || true
 
 RAW="$OUTDIR/raw.jsonl"
 if [[ ! -s "$RAW" ]]; then
-  echo "[-] httpx produced no output (0 live URLs found)"
+  echo "[-] $HTTPX_CMD produced no output (0 live URLs found)"
   echo "Triage summary — $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$OUTDIR/summary.txt"
   echo "-------------------------------------------" >> "$OUTDIR/summary.txt"
   echo "Input URLs       : $TOTAL" >> "$OUTDIR/summary.txt"
