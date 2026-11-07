@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       targets:
-        description: 'Target(s) — comma, space, or newline separated (e.g. api.example.com dev.example.com)'
+        description: 'Target(s) — comma, space, or newline separated'
         required: true
         type: string
       wordlist:
@@ -14,7 +14,7 @@ on:
         default: 'quick'
         options: [quick, standard, deep, custom]
       custom_wordlist:
-        description: 'Custom wordlist URL (only used when wordlist=custom)'
+        description: 'Custom wordlist URL (only when wordlist=custom)'
         required: false
         type: string
         default: ''
@@ -35,10 +35,10 @@ on:
         type: string
         default: '20'
       rate:
-        description: 'Max req/sec (empty = auto)'
+        description: 'Max req/sec (default 20)'
         required: false
         type: string
-        default: ''
+        default: '20'
 
 concurrency:
   group: dirfuzz-${{ github.run_id }}
@@ -57,11 +57,6 @@ jobs:
         with:
           ref: ${{ github.ref }}
 
-      - name: Verify scripts exist
-        run: |
-          test -f fuzzall.sh || { echo "❌ fuzzall.sh missing"; exit 1; }
-          echo "✅ fuzzall.sh present"
-
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
@@ -79,16 +74,12 @@ jobs:
           go install github.com/ffuf/ffuf/v2@latest
           pip3 install --quiet uro
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-          ffuf -V
-          uro --help >/dev/null && echo "uro OK"
 
       - name: Install feroxbuster
         run: |
           mkdir -p "$HOME/.local/bin"
-          curl -sL https://raw.githubusercontent.com/epi052/feroxbuster/main/install-nix.sh \
-            | bash -s "$HOME/.local/bin"
+          curl -sL https://raw.githubusercontent.com/epi052/feroxbuster/main/install-nix.sh | bash -s "$HOME/.local/bin"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/feroxbuster" --version
 
       - name: Download wordlist
         id: wl
@@ -105,54 +96,107 @@ jobs:
           esac
           echo "Downloading: $URL"
           curl -fsSL "$URL" -o wordlists/target.txt
-          lines=$(wc -l < wordlists/target.txt | tr -d ' ')
-          echo "lines=$lines" >> "$GITHUB_OUTPUT"
-          echo "[+] $lines entries"
+          echo "[+] $(wc -l < wordlists/target.txt) entries downloaded."
 
       - name: Parse targets
         id: parse
         env:
           TARGETS: ${{ inputs.targets }}
         run: |
-          if [ -z "$TARGETS" ]; then
-            echo "❌ Error: The 'targets' input cannot be empty. Please provide at least one domain."
-            exit 1
-          fi
+          if [ -z "$TARGETS" ]; then exit 1; fi
           mkdir -p work
-          # Replaces commas, spaces, and tabs with newlines
-          echo "$TARGETS" | tr -s ' ,\t' '\n' \
-            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d' \
-            > work/subs.txt
-          n=$(wc -l < work/subs.txt | tr -d ' ')
-          echo "count=$n" >> "$GITHUB_OUTPUT"
-          cat work/subs.txt
-          test -s work/subs.txt
+          echo "$TARGETS" | tr -s ' ,\t' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d' > work/subs.txt
+          echo "count=$(wc -l < work/subs.txt)" >> "$GITHUB_OUTPUT"
 
-      - name: Make script executable
+      # ==========================================
+      # THIS STEP BUILDS AND RUNS THE SCRIPT
+      # ==========================================
+      - name: Generate and Run fuzzall.sh
+        env:
+          THREADS:   ${{ inputs.threads }}
+          RATE:      ${{ inputs.rate }}
+          DEPTH:     ${{ inputs.depth }}
+          RECURSION: ${{ inputs.recursion }}
         run: |
-          test -f fuzzall.sh || { echo "❌ fuzzall.sh missing"; exit 1; }
+          # 1. Write the bash script to a file on the runner
+          cat > fuzzall.sh << 'SCRIPT_EOF'
+          #!/usr/bin/env bash
+          set -uo pipefail
+
+          WORDLIST=""
+          SUBS_FILE=""
+          THREADS=20
+          RATE=20
+          OUTDIR="./fuzz_out"
+          FEROX_RECURSION=1
+          FEROX_DEPTH=""
+
+          while [[ $# -gt 0 ]]; do
+            case "$1" in
+              -w) WORDLIST="$2"; shift 2 ;;
+              -l) SUBS_FILE="$2"; shift 2 ;;
+              -t) THREADS="$2"; shift 2 ;;
+              -R|--rate) RATE="$2"; shift 2 ;;
+              -o) OUTDIR="$2"; shift 2 ;;
+              -d) FEROX_DEPTH="$2"; shift 2 ;;
+              --no-recursion) FEROX_RECURSION=0; shift ;;
+              *) shift ;;
+            esac
+          done
+
+          mkdir -p "$OUTDIR"
+          TMP="$OUTDIR/.tmp"
+          mkdir -p "$TMP"
+
+          clean_subs () {
+            tr -d '\r' < "$1" | sed -E 's/#.*$//; s/^[[:space:]]+//; s/[[:space:]]+$//' | sed -E '/^$/d' | sed -E 's#^([^:/]+)$#https://\1#' | sort -u
+          }
+
+          dedupe () {
+            if command -v uro >/dev/null 2>&1; then uro | sort -u; else sort -u; fi
+          }
+
+          CLEANED="$OUTDIR/subs.cleaned.txt"
+          clean_subs "$SUBS_FILE" > "$CLEANED"
+
+          while IFS= read -r entry; do
+            [[ -z "$entry" ]] && continue
+            url="$entry"
+            safe=$(printf '%s' "$url" | sed -E 's#https?://##; s#[/:?&=]#_#g; s#_+$##')
+            base="$OUTDIR/$safe"
+
+            echo "[*] target: $url"
+
+            ferox_args=(-u "$url" -w "$WORDLIST" -t "$THREADS" --rate-limit "$RATE" --scan-limit 2 --auto-tune --auto-bail --timeout 10 --json -o "${base}.ferox.jsonl" -q)
+            [[ "$FEROX_RECURSION" -eq 0 ]] && ferox_args+=( --no-recursion )
+            [[ -n "$FEROX_DEPTH" ]]        && ferox_args+=( --depth "$FEROX_DEPTH" )
+
+            feroxbuster "${ferox_args[@]}" >/dev/null 2>&1 || true
+
+            ffuf -w "$WORDLIST" -u "${url%/}/FUZZ" -t "$THREADS" -rate "$RATE" -timeout 10 -ac -of json -o "${base}.ffuf.json" -s >/dev/null 2>&1 || true
+
+            jq -r '.url // empty' "${base}.ferox.jsonl" 2>/dev/null > "${TMP}/${safe}.ferox.urls" || true
+            jq -r '.results[]?.url // empty' "${base}.ffuf.json" 2>/dev/null > "${TMP}/${safe}.ffuf.urls" || true
+
+            cat "${TMP}/${safe}.ferox.urls" "${TMP}/${safe}.ffuf.urls" 2>/dev/null | sed '/^[[:space:]]*$/d' | dedupe > "${base}.urls.txt"
+          done < "$CLEANED"
+
+          MASTER="$OUTDIR/ALL_UNIQUE_URLS.txt"
+          cat "$OUTDIR"/*.urls.txt 2>/dev/null | sed '/^[[:space:]]*$/d' | dedupe > "$MASTER"
+          echo "[+] Master file: $MASTER"
+          SCRIPT_EOF
+
+          # 2. Make it executable
           chmod +x fuzzall.sh
 
-      - name: Run directory fuzz
-        env:
-          THREADS:    ${{ inputs.threads }}
-          RATE_IN:    ${{ inputs.rate }}
-          DEPTH:      ${{ inputs.depth }}
-          RECURSION:  ${{ inputs.recursion }}
-          WL_TIER:    ${{ inputs.wordlist }}
-        run: |
-          set -euo pipefail
-          RATE="$RATE_IN"
-          if [ -z "$RATE" ]; then
-            case "$WL_TIER" in quick) RATE=20 ;; *) RATE=50 ;; esac
-            echo "[*] Auto rate: $RATE req/s"
-          fi
+          # 3. Run it!
           ARGS=(-w wordlists/target.txt -l work/subs.txt -t "$THREADS" -R "$RATE" -o fuzz_out)
           if [ "$RECURSION" = "off" ]; then
             ARGS+=(--no-recursion)
           elif [ -n "$DEPTH" ] && [ "$DEPTH" != "0" ]; then
             ARGS+=(-d "$DEPTH")
           fi
+          
           echo "▶ ./fuzzall.sh ${ARGS[*]}"
           ./fuzzall.sh "${ARGS[@]}"
 
@@ -172,43 +216,14 @@ jobs:
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           RUN_URL:            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           TARGET_COUNT:       ${{ steps.parse.outputs.count }}
-          WL_TIER:            ${{ inputs.wordlist }}
-          RECURSION:          ${{ inputs.recursion }}
-          JOB_STATUS:         ${{ job.status }}
         run: |
-          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
-            echo "[!] Telegram secrets not configured — skipping"; exit 0
-          fi
-          MSG="$RUNNER_TEMP/tg.txt"
-          total=0
-          [ -f fuzz_out/ALL_UNIQUE_URLS.txt ] && total=$(wc -l < fuzz_out/ALL_UNIQUE_URLS.txt | tr -d ' ')
-          {
-            echo "📂 DIR FUZZ — ${JOB_STATUS}"
-            echo "Targets: ${TARGET_COUNT}"
-            echo "Wordlist: ${WL_TIER} | Recursion: ${RECURSION}"
-            echo ""
-            echo "📊 Results"
-            echo "• Unique URLs: ${total}"
-            echo ""
-            if [ "$total" -gt 0 ]; then
-              echo "🎯 Top URLs:"
-              head -20 fuzz_out/ALL_UNIQUE_URLS.txt | sed 's/^/  /'
-              [ "$total" -gt 20 ] && echo "  ... +$((total - 20)) more"
-              echo ""
-            fi
-            echo "🔗 ${RUN_URL}"
-          } > "$MSG"
-          if [ "$(wc -c < "$MSG")" -gt 4000 ]; then
-            head -c 3900 "$MSG" > "${MSG}.t"
-            printf '\n\n... [truncated]\n' >> "${MSG}.t"
-            mv "${MSG}.t" "$MSG"
-          fi
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then exit 0; fi
+          total=0; [ -f fuzz_out/ALL_UNIQUE_URLS.txt ] && total=$(wc -l < fuzz_out/ALL_UNIQUE_URLS.txt)
+          
+          MSG="📂 DIR FUZZ — ${{ job.status }}%0A• Targets: ${TARGET_COUNT}%0A• Unique URLs: ${total}%0A🔗 ${RUN_URL}"
           curl -sS -o /dev/null -w '[+] Telegram: HTTP %{http_code}\n' \
             -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text@${MSG}" \
-            -d "disable_web_page_preview=true" \
-            --max-time 30 || echo "[!] Telegram send failed (continuing)"
+            -d "chat_id=${TELEGRAM_CHAT_ID}&text=${MSG}" || true
 
       - name: Summary
         if: always()
@@ -217,19 +232,15 @@ jobs:
           {
             echo "## Directory Fuzz"
             echo "| Targets | ${{ steps.parse.outputs.count }} |"
-            echo "| Wordlist | \`${{ inputs.wordlist }}\` (${{ steps.wl.outputs.lines }} entries) |"
+            echo "| Wordlist | \`${{ inputs.wordlist }}\` |"
             echo "| Recursion | \`${{ inputs.recursion }}\` |"
-            echo "| Depth | \`${{ inputs.depth }}\` |"
             echo ""
             if [ -f fuzz_out/ALL_UNIQUE_URLS.txt ]; then
               n=$(wc -l < fuzz_out/ALL_UNIQUE_URLS.txt | tr -d ' ')
               echo "### ✅ Unique URLs: $n"
               echo '```'; head -100 fuzz_out/ALL_UNIQUE_URLS.txt; echo '```'
             else
-              echo "### ⚠️ No results — \`fuzz_out/ALL_UNIQUE_URLS.txt\` not produced"
-              echo '```'
-              ls -la fuzz_out/ 2>/dev/null || echo "directory does not exist"
-              echo '```'
+              echo "### ⚠️ No results produced."
             fi
           } >> "$GITHUB_STEP_SUMMARY" || true
         continue-on-error: true
