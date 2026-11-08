@@ -37,7 +37,7 @@ concurrency:
 jobs:
   enumerate:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 60
     permissions:
       contents: read
 
@@ -46,11 +46,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
-
-      - name: Verify scripts exist
-        run: |
-          test -f subfuzz.sh || { echo "❌ subfuzz.sh missing"; exit 1; }
-          echo "✅ subfuzz.sh present"
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -66,7 +61,8 @@ jobs:
       - name: Install base packages
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq jq curl dnsutils
+          # Added build-essential to ensure massdns compiles
+          sudo apt-get install -y -qq jq curl dnsutils build-essential
 
       - name: Install massdns
         run: |
@@ -91,15 +87,12 @@ jobs:
       - name: Install dnsgen
         run: pip install --quiet dnsgen
 
-      # FIXED: Verify tools are installed before running the script
       - name: Verify tools
         run: |
           export PATH="$PATH:$HOME/go/bin"
           MISSING=""
           for t in subfinder dnsx httpx puredns massdns jq curl; do
-            if ! command -v "$t" >/dev/null 2>&1; then
-              MISSING="$MISSING $t"
-            fi
+            if ! command -v "$t" >/dev/null 2>&1; then MISSING="$MISSING $t"; fi
           done
           if [ -n "$MISSING" ]; then
             echo "❌ CRITICAL: Missing required tools:$MISSING"
@@ -110,12 +103,8 @@ jobs:
       - name: Download wordlists
         run: |
           mkdir -p wordlists
-          curl -fsSL \
-            https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-5000.txt \
-            -o wordlists/subdomains.txt
-          curl -fsSL \
-            https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/dns-Jhaddix.txt \
-            -o wordlists/permutations.txt
+          curl -fsSL https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-5000.txt -o wordlists/subdomains.txt
+          curl -fsSL https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/dns-Jhaddix.txt -o wordlists/permutations.txt
           wc -l wordlists/subdomains.txt wordlists/permutations.txt
           test -s wordlists/subdomains.txt
           test -s wordlists/permutations.txt
@@ -130,12 +119,10 @@ jobs:
           test -s resolvers.txt
           echo "resolvers.txt lines: $(wc -l < resolvers.txt)"
 
-      - name: Make script executable
-        run: |
-          test -f subfuzz.sh || { echo "❌ subfuzz.sh missing"; exit 1; }
-          chmod +x subfuzz.sh
-
-      - name: Run enumeration
+      # ==========================================
+      # THIS STEP BUILDS AND RUNS THE SCRIPT
+      # ==========================================
+      - name: Generate and Run subfuzz.sh
         env:
           TARGET:  ${{ inputs.target }}
           MODE:    ${{ inputs.mode }}
@@ -143,23 +130,129 @@ jobs:
           THREADS: ${{ inputs.threads }}
           RATE:    ${{ inputs.rate }}
         run: |
-          set -euo pipefail
           export PATH="$PATH:$HOME/go/bin"
-          
-          if [ -z "$TARGET" ]; then
-            echo "❌ Error: The 'target' input cannot be empty."
-            exit 1
-          fi
-          [[ "$TARGET" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]] || { echo "invalid domain: $TARGET"; exit 1; }
 
+          # 1. Write the bash script to a file on the runner
+          cat > subfuzz.sh << 'SCRIPT_EOF'
+          #!/usr/bin/env bash
+          set -uo pipefail
+
+          TARGET=""
+          OUTDIR="./subenum_out"
+          WORDLIST=""
+          RESOLVERS=""
+          MODE="active"
+          RECURSION_DEPTH=0
+          PERM_WORDLIST=""
+          THREADS=20
+          RATE=20
+
+          while [[ $# -gt 0 ]]; do
+            case "$1" in
+              -d) TARGET="$2"; shift 2 ;;
+              -w) WORDLIST="$2"; shift 2 ;;
+              -r|--resolvers) RESOLVERS="$2"; shift 2 ;;
+              -o) OUTDIR="$2"; shift 2 ;;
+              -t) THREADS="$2"; shift 2 ;;
+              -R|--rate) RATE="$2"; shift 2 ;;
+              --mode) MODE="$2"; shift 2 ;;
+              --depth) RECURSION_DEPTH="$2"; shift 2 ;;
+              --perm) PERM_WORDLIST="$2"; shift 2 ;;
+              *) shift ;;
+            esac
+          done
+
+          mkdir -p "$OUTDIR"
+          TMP="$OUTDIR/.tmp"
+          mkdir -p "$TMP"
+
+          dedupe () { if command -v anew >/dev/null 2>&1; then anew "$@"; else sort -u; fi; }
+
+          rate_guard () {
+            local base_rate=$1; shift
+            local rate=$base_rate fails=0
+            while true; do
+              "$@" -rate "$rate" 2>&1 | tee "$TMP/rate_guard.log"
+              if grep -qiE '429|403|REFUSED|SERVFAIL' "$TMP/rate_guard.log"; then
+                rate=$(( rate / 2 )); (( rate < 1 )) && rate=1
+                fails=$(( fails + 1 ))
+                sleep $(( 15 * fails ))
+                (( fails >= 3 )) && return 1
+              else
+                break
+              fi
+            done
+          }
+
+          echo "[*] Phase 1: Passive enumeration for $TARGET"
+          : > "$TMP/sub_all.txt"
+          command -v subfinder   >/dev/null && subfinder -d "$TARGET" -all -silent -o "$TMP/sub_subfinder.txt" 2>/dev/null || true
+          command -v assetfinder >/dev/null && assetfinder --subs-only "$TARGET" > "$TMP/sub_assetfinder.txt" 2>/dev/null || true
+          command -v amass       >/dev/null && amass enum -passive -d "$TARGET" -o "$TMP/sub_amass.txt" 2>/dev/null || true
+
+          curl -s "https://crt.sh/?q=%25.$TARGET&output=json" | jq -r '.[].name_value' | sed 's/\*\.//g' | tr ',' '\n' | grep -oE "[A-Za-z0-9._-]+\.${TARGET}" | sort -u > "$TMP/sub_crt.txt" 2>/dev/null || true
+
+          find "$TMP" -maxdepth 1 -name 'sub_*.txt' -exec cat {} + 2>/dev/null | sed '/^$/d' | dedupe "$OUTDIR/passive_subs.txt" || touch "$OUTDIR/passive_subs.txt"
+          echo "[+] Passive: $(wc -l < "$OUTDIR/passive_subs.txt" | tr -d ' ') candidates"
+
+          cp "$OUTDIR/passive_subs.txt" "$OUTDIR/all_subs_raw.txt"
+          if [[ "$MODE" != "passive" ]]; then
+            echo "[*] Phase 2: Active bruteforce (puredns)"
+            timeout 600 puredns bruteforce "$WORDLIST" "$TARGET" -r "$RESOLVERS" -t "$THREADS" -o "$TMP/sub_bruteforce.txt" > /dev/null 2>&1 || true
+            find "$OUTDIR/passive_subs.txt" "$TMP/sub_bruteforce.txt" -type f -exec cat {} + 2>/dev/null | sed '/^$/d' | dedupe "$OUTDIR/all_subs_raw.txt" || touch "$OUTDIR/all_subs_raw.txt"
+          fi
+          echo "[+] Raw merged: $(wc -l < "$OUTDIR/all_subs_raw.txt" | tr -d ' ') candidates"
+
+          echo "[*] Phase 3: Resolve (dnsx)"
+          random_name="nonexistent-$(head -c 200 /dev/urandom | tr -dc a-z | head -c 8).$TARGET"
+          wildcard_ip=$(dig +short "$random_name" A 2>/dev/null | head -n1 || true)
+          if [[ -n "$wildcard_ip" ]]; then
+            dnsx -l "$OUTDIR/all_subs_raw.txt" -a -resp -silent -wd "$TARGET" -o "$TMP/resolved.txt" > /dev/null 2>&1 || true
+          else
+            dnsx -l "$OUTDIR/all_subs_raw.txt" -a -resp -silent -o "$TMP/resolved.txt" > /dev/null 2>&1 || true
+          fi
+          sed -E 's/[[:space:]].*$//' "$TMP/resolved.txt" 2>/dev/null | sed '/^$/d' | dedupe "$OUTDIR/resolved_subs.txt" || touch "$OUTDIR/resolved_subs.txt"
+          echo "[+] Resolved: $(wc -l < "$OUTDIR/resolved_subs.txt" | tr -d ' ') live subdomains"
+
+          if [[ "$MODE" == "full" && "$RECURSION_DEPTH" -gt 0 ]]; then
+            echo "[*] Phase 4: Recursion (depth=$RECURSION_DEPTH)"
+            if [[ -n "$PERM_WORDLIST" && -r "$PERM_WORDLIST" ]]; then
+              if command -v gotator >/dev/null 2>&1; then
+                gotator -sub "$OUTDIR/resolved_subs.txt" -perm "$PERM_WORDLIST" -depth "$RECURSION_DEPTH" -numbers 10 > "$TMP/permuted_candidates.txt" 2>/dev/null || true
+              elif command -v dnsgen >/dev/null 2>&1; then
+                input="$OUTDIR/resolved_subs.txt"
+                for ((i=1; i<=RECURSION_DEPTH; i++)); do dnsgen "$input" > "$TMP/perm_$i.txt" 2>/dev/null || true; input="$TMP/perm_$i.txt"; done
+                cat "$TMP"/perm_*.txt > "$TMP/permuted_candidates.txt" 2>/dev/null || true
+              fi
+              if [[ -s "$TMP/permuted_candidates.txt" ]]; then
+                rate_guard "$RATE" puredns resolve "$TMP/permuted_candidates.txt" -r "$RESOLVERS" -t "$THREADS" -o "$TMP/permuted_resolved.txt" > /dev/null 2>&1 || true
+                if [[ -s "$TMP/permuted_resolved.txt" ]]; then
+                  find "$OUTDIR/resolved_subs.txt" "$TMP/permuted_resolved.txt" -type f -exec cat {} + 2>/dev/null | sed '/^$/d' | dedupe "$TMP/resolved_with_recursion.txt" || true
+                  mv "$TMP/resolved_with_recursion.txt" "$OUTDIR/resolved_subs.txt" 2>/dev/null || true
+                fi
+              fi
+            fi
+          fi
+
+          echo "[*] Phase 5: HTTP probing (httpx)"
+          httpx -l "$OUTDIR/resolved_subs.txt" -ports 80,443,8080,8443 -sc -title -tech-detect -cdn -silent -t "$THREADS" -rl "$RATE" -timeout 10 -o "$OUTDIR/live_hosts.txt" > /dev/null 2>&1 || true
+          echo "[+] Live HTTP hosts: $(wc -l < "$OUTDIR/live_hosts.txt" | tr -d ' ')"
+          SCRIPT_EOF
+
+          # 2. Make it executable
+          chmod +x subfuzz.sh
+
+          # 3. Debug: Print the first few lines of the script to verify it's not corrupted
+          echo "--- First 10 lines of generated script ---"
+          head -n 10 subfuzz.sh
+          echo "------------------------------------------"
+
+          # 4. Run it
+          if [ -z "$TARGET" ]; then exit 1; fi
           ARGS=(-d "$TARGET" -w wordlists/subdomains.txt -r resolvers.txt -t "$THREADS" -R "$RATE")
-
-          if [ "$MODE" = "passive" ]; then
-            ARGS+=(--mode passive)
-          elif [ "$MODE" = "full" ] && [ "$DEPTH" != "0" ]; then
-            ARGS+=(--mode full --depth "$DEPTH" --perm wordlists/permutations.txt)
-          fi
-
+          if [ "$MODE" = "passive" ]; then ARGS+=(--mode passive); fi
+          if [ "$MODE" = "full" ] && [ "$DEPTH" != "0" ]; then ARGS+=(--mode full --depth "$DEPTH" --perm wordlists/permutations.txt); fi
+          
           echo "▶ ./subfuzz.sh ${ARGS[*]}"
           ./subfuzz.sh "${ARGS[@]}"
 
@@ -179,89 +272,31 @@ jobs:
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           RUN_URL:            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           TARGET:             ${{ inputs.target }}
-          MODE:               ${{ inputs.mode }}
-          DEPTH:              ${{ inputs.depth }}
-          JOB_STATUS:         ${{ job.status }}
         run: |
-          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
-            echo "[!] Telegram secrets not configured — skipping"
-            exit 0
-          fi
-          MSG="$RUNNER_TEMP/tg.txt"
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then exit 0; fi
           passive=0; resolved=0; live=0
-          [ -f subenum_out/passive_subs.txt ]  && passive=$(wc -l < subenum_out/passive_subs.txt  | tr -d ' ')
-          [ -f subenum_out/resolved_subs.txt ] && resolved=$(wc -l < subenum_out/resolved_subs.txt | tr -d ' ')
-          [ -f subenum_out/live_hosts.txt ]    && live=$(wc -l < subenum_out/live_hosts.txt    | tr -d ' ')
-          {
-            echo "🔍 SUBFUZZ — ${JOB_STATUS}"
-            echo "Target: ${TARGET}"
-            echo "Mode:   ${MODE} (depth=${DEPTH})"
-            echo ""
-            echo "📊 Results"
-            echo "• Passive candidates: ${passive}"
-            echo "• Resolved:           ${resolved}"
-            echo "• Live HTTP hosts:    ${live}"
-            echo ""
-            if [ "$live" -gt 0 ]; then
-              echo "🌐 Top live hosts:"
-              head -15 subenum_out/live_hosts.txt | sed 's/^/  /'
-              [ "$live" -gt 15 ] && echo "  ... +$((live - 15)) more"
-              echo ""
-            fi
-            echo "🔗 ${RUN_URL}"
-          } > "$MSG"
-          if [ "$(wc -c < "$MSG")" -gt 4000 ]; then
-            head -c 3900 "$MSG" > "${MSG}.t"
-            printf '\n\n... [truncated]\n' >> "${MSG}.t"
-            mv "${MSG}.t" "$MSG"
-          fi
+          [ -f subenum_out/passive_subs.txt ]  && passive=$(wc -l < subenum_out/passive_subs.txt)
+          [ -f subenum_out/resolved_subs.txt ] && resolved=$(wc -l < subenum_out/resolved_subs.txt)
+          [ -f subenum_out/live_hosts.txt ]    && live=$(wc -l < subenum_out/live_hosts.txt)
+          
+          MSG="🔍 SUBFUZZ — ${TARGET}%0A• Passive: ${passive}%0A• Resolved: ${resolved}%0A• Live: ${live}%0A🔗 ${RUN_URL}"
           curl -sS -o /dev/null -w '[+] Telegram: HTTP %{http_code}\n' \
             -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text@${MSG}" \
-            -d "disable_web_page_preview=true" \
-            --max-time 30 || echo "[!] Telegram send failed (continuing)"
+            -d "chat_id=${TELEGRAM_CHAT_ID}&text=${MSG}" || true
 
       - name: Write summary
         if: always()
-        shell: bash
         run: |
           {
             echo "## Subdomain Fuzz — \`${{ inputs.target }}\`"
-            echo ""
-            echo "| Setting | Value |"
-            echo "|---|---|"
             echo "| Mode | \`${{ inputs.mode }}\` |"
             echo "| Depth | \`${{ inputs.depth }}\` |"
-            echo "| Threads | \`${{ inputs.threads }}\` |"
-            echo "| Rate | \`${{ inputs.rate }}\` req/s |"
             echo ""
-            found=0
             if [ -f subenum_out/live_hosts.txt ]; then
-              found=1
               echo "### ✅ Live hosts ($(wc -l < subenum_out/live_hosts.txt))"
-              echo '```'
-              head -50 subenum_out/live_hosts.txt
-              echo '```'
-              echo ""
-            fi
-            if [ -f subenum_out/resolved_subs.txt ]; then
-              found=1
-              echo "### 🔎 Resolved ($(wc -l < subenum_out/resolved_subs.txt))"
-              echo '```'
-              head -50 subenum_out/resolved_subs.txt
-              echo '```'
-              echo ""
-            fi
-            if [ "$found" -eq 0 ]; then
-              echo "### ⚠️ No results produced"
-              echo ""
-              echo "Check the **Run enumeration** step — it likely failed or produced no output."
-              echo ""
-              echo "Contents of \`subenum_out/\`:"
-              echo '```'
-              ls -la subenum_out/ 2>/dev/null || echo "directory does not exist"
-              echo '```'
+              echo '```'; head -50 subenum_out/live_hosts.txt; echo '```'
+            else
+              echo "### ⚠️ No results produced."
             fi
           } >> "$GITHUB_STEP_SUMMARY" || true
         continue-on-error: true
