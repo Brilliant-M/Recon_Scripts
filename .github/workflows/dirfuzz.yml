@@ -1,43 +1,63 @@
-name: Subdomain Fuzz
+name: Directory Fuzz
 
 on:
   workflow_dispatch:
     inputs:
-      target:
-        description: 'Target root domain (e.g. example.com)'
+      targets:
+        description: 'Target(s) — comma, space, or newline separated'
         required: true
         type: string
-      mode:
-        description: 'Scan mode'
+      wordlist:
+        description: 'Wordlist tier'
         required: true
         type: choice
-        default: 'active'
-        options: [passive, active, full]
+        default: 'quick'
+        options: [quick, standard, deep, custom]
+      custom_wordlist:
+        description: 'Custom wordlist URL (http/https only; used when wordlist=custom)'
+        required: false
+        type: string
+        default: ''
+      recursion:
+        description: 'Recursion (feroxbuster)'
+        required: true
+        type: choice
+        default: 'off'
+        options: ['off', 'on']
       depth:
-        description: 'Recursion depth (0 = off, only used when mode=full)'
-        required: true
-        type: choice
-        default: '0'
-        options: ['0', '1', '2', '3']
+        description: 'Max recursion depth (recursion=on only; 0 = unlimited)'
+        required: false
+        type: string
+        default: '2'
       threads:
         description: 'Threads (default 20)'
         required: false
         type: string
         default: '20'
       rate:
-        description: 'Rate limit req/s (default 20)'
+        description: 'Max req/sec (default 20)'
         required: false
         type: string
         default: '20'
+      exclude_codes:
+        description: 'Comma-separated status codes to drop from merged results (e.g. 403,500)'
+        required: false
+        type: string
+        default: ''
+      per_target_timeout:
+        description: 'Max minutes to spend per target, per tool (default 15)'
+        required: false
+        type: string
+        default: '15'
 
 concurrency:
-  group: subfuzz-${{ inputs.target }}
+  group: dirfuzz-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
-  enumerate:
+  fuzz:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     permissions:
       contents: read
 
@@ -47,123 +67,153 @@ jobs:
         with:
           ref: ${{ github.ref }}
 
+      # All free-text inputs are validated BEFORE any tool runs, and everywhere
+      # below they are passed via `env:` + `$VAR`, never spliced into run: text
+      # directly — the old workflow interpolated some inputs straight into shell
+      # (e.g. `URL="${{ inputs.custom_wordlist }}"`), which is a classic GitHub
+      # Actions script-injection hole: a crafted input value could break out of
+      # the quotes and run arbitrary commands on the runner.
+      - name: Validate inputs
+        env:
+          WORDLIST_TIER: ${{ inputs.wordlist }}
+          CUSTOM_WORDLIST: ${{ inputs.custom_wordlist }}
+          DEPTH: ${{ inputs.depth }}
+          THREADS: ${{ inputs.threads }}
+          RATE: ${{ inputs.rate }}
+          TIMEOUT_MIN: ${{ inputs.per_target_timeout }}
+          EXCLUDE_CODES: ${{ inputs.exclude_codes }}
+        run: |
+          set -euo pipefail
+          err() { echo "❌ $1"; exit 1; }
+
+          [[ "$THREADS"     =~ ^[0-9]+$ ]] || err "threads must be a positive integer"
+          [[ "$RATE"        =~ ^[0-9]+$ ]] || err "rate must be a positive integer"
+          [[ "$DEPTH"       =~ ^[0-9]+$ ]] || err "depth must be a non-negative integer (0 = unlimited)"
+          [[ "$TIMEOUT_MIN" =~ ^[0-9]+$ ]] || err "per_target_timeout must be a positive integer"
+
+          if [ -n "$EXCLUDE_CODES" ]; then
+            [[ "$EXCLUDE_CODES" =~ ^[0-9]+(,[0-9]+)*$ ]] || err "exclude_codes must be comma-separated numbers, e.g. 403,500"
+          fi
+
+          if [ "$WORDLIST_TIER" = "custom" ]; then
+            [ -z "$CUSTOM_WORDLIST" ] && err "custom_wordlist URL required when wordlist=custom"
+            [[ "$CUSTOM_WORDLIST" =~ ^https?:// ]] || err "custom_wordlist must be an http(s) URL"
+          fi
+          echo "✅ inputs OK"
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
           cache: false
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
       - name: Install base packages
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq jq curl dnsutils build-essential
+          sudo apt-get install -y -qq jq curl unzip
 
-      - name: Install massdns
-        run: |
-          git clone --depth 1 https://github.com/blechschmidt/massdns.git /tmp/massdns
-          cd /tmp/massdns
-          make -j
-          sudo make install
-          # Verify massdns is installed
-          which massdns || { echo "❌ massdns not found in PATH after install"; exit 1; }
-          massdns --version
-
-      - name: Install Go tools
+      - name: Install ffuf + uro
         run: |
           export PATH="$PATH:$(go env GOPATH)/bin"
-          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-          go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
-          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
-          go install github.com/tomnomnom/assetfinder@latest
-          go install github.com/d3mondev/puredns/v2@latest
-          go install github.com/Josue87/gotator@latest
-          go install github.com/owasp-amass/amass/v4/...@master || echo "amass install failed (optional)"
-          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+          # Pinned instead of @latest — bump this deliberately when you want to upgrade.
+          go install github.com/ffuf/ffuf/v2@v2.1.0
+          pip3 install --quiet uro
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          ffuf -V
+          uro --help >/dev/null && echo "uro OK"
 
-      - name: Install dnsgen
-        run: pip install --quiet dnsgen
-
-      - name: Verify tools & PATH
+      - name: Install feroxbuster
         run: |
-          # FIXED: Explicitly include /usr/local/bin for massdns
-          export PATH="$PATH:$HOME/go/bin:/usr/local/bin"
-          echo "PATH is: $PATH"
-          MISSING=""
-          for t in subfinder dnsx httpx puredns massdns jq curl; do
-            if ! command -v "$t" >/dev/null 2>&1; then MISSING="$MISSING $t"; fi
-          done
-          if [ -n "$MISSING" ]; then
-            echo "❌ CRITICAL: Missing required tools:$MISSING"
-            exit 1
-          fi
-          echo "✅ All required tools are installed and in PATH."
-          echo "puredns path: $(which puredns)"
-          echo "massdns path: $(which massdns)"
+          mkdir -p "$HOME/.local/bin"
+          # Pinned to a tag instead of `main` — bump deliberately when you want to upgrade.
+          FEROX_REF="v2.10.1"
+          curl -sL "https://raw.githubusercontent.com/epi052/feroxbuster/${FEROX_REF}/install-nix.sh" | bash -s "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/feroxbuster" --version
 
-      - name: Download wordlists
+      - name: Cache wordlist
+        id: wl_cache
+        uses: actions/cache@v4
+        with:
+          path: wordlists/target.txt
+          key: wordlist-${{ inputs.wordlist }}-${{ inputs.custom_wordlist }}
+
+      - name: Download wordlist
+        if: steps.wl_cache.outputs.cache-hit != 'true'
+        env:
+          WORDLIST_TIER: ${{ inputs.wordlist }}
+          CUSTOM_WORDLIST: ${{ inputs.custom_wordlist }}
         run: |
           mkdir -p wordlists
-          curl -fsSL https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-5000.txt -o wordlists/subdomains.txt
-          curl -fsSL https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/dns-Jhaddix.txt -o wordlists/permutations.txt
-          wc -l wordlists/subdomains.txt wordlists/permutations.txt
-          test -s wordlists/subdomains.txt
-          test -s wordlists/permutations.txt
+          case "$WORDLIST_TIER" in
+            quick)    URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt" ;;
+            standard) URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/directory-list-2.3-medium.txt" ;;
+            deep)     URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-large-directories.txt" ;;
+            custom)   URL="$CUSTOM_WORDLIST" ;;
+          esac
+          echo "Downloading: $URL"
+          curl -fsSL "$URL" -o wordlists/target.txt
 
-      - name: Initialize resolvers
+      - name: Wordlist stats
+        id: wl
         run: |
-          export PATH="$PATH:$(go env GOPATH)/bin:/usr/local/bin"
-          if ! puredns init; then
-            echo "puredns init failed — falling back to trickest/resolvers"
-            curl -fsSL https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt -o resolvers.txt
+          lines=$(wc -l < wordlists/target.txt | tr -d ' ')
+          echo "lines=$lines" >> "$GITHUB_OUTPUT"
+          echo "[+] $lines entries ready."
+
+      - name: Parse targets
+        id: parse
+        env:
+          TARGETS: ${{ inputs.targets }}
+        run: |
+          if [ -z "$TARGETS" ]; then
+            echo "❌ Error: The 'targets' input cannot be empty."
+            exit 1
           fi
-          test -s resolvers.txt
-          echo "resolvers.txt lines: $(wc -l < resolvers.txt)"
+          mkdir -p work
+          echo "$TARGETS" | tr -s ' ,\t' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d' > work/subs.txt
+          n=$(wc -l < work/subs.txt | tr -d ' ')
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          cat work/subs.txt
 
       # ==========================================
       # THIS STEP BUILDS AND RUNS THE SCRIPT
       # ==========================================
-      - name: Generate and Run subfuzz.sh
+      - name: Generate and Run fuzzall.sh
         env:
-          TARGET:  ${{ inputs.target }}
-          MODE:    ${{ inputs.mode }}
-          DEPTH:   ${{ inputs.depth }}
-          THREADS: ${{ inputs.threads }}
-          RATE:    ${{ inputs.rate }}
+          THREADS:       ${{ inputs.threads }}
+          RATE:          ${{ inputs.rate }}
+          DEPTH:         ${{ inputs.depth }}
+          RECURSION:     ${{ inputs.recursion }}
+          EXCLUDE_CODES: ${{ inputs.exclude_codes }}
+          TIMEOUT_MIN:   ${{ inputs.per_target_timeout }}
         run: |
-          # FIXED: Explicitly add /usr/local/bin to PATH for massdns
-          export PATH="$PATH:$HOME/go/bin:/usr/local/bin"
-
           # 1. Write the bash script to a file on the runner
-          cat > subfuzz.sh << 'SCRIPT_EOF'
+          cat > fuzzall.sh << 'SCRIPT_EOF'
           #!/usr/bin/env bash
           set -uo pipefail
 
-          TARGET=""
-          OUTDIR="./subenum_out"
           WORDLIST=""
-          RESOLVERS=""
-          MODE="active"
-          RECURSION_DEPTH=0
-          PERM_WORDLIST=""
+          SUBS_FILE=""
           THREADS=20
           RATE=20
+          OUTDIR="./fuzz_out"
+          FEROX_RECURSION=1
+          FEROX_DEPTH=""
+          TARGET_TIMEOUT=900
+          EXCLUDE_CODES=""
 
           while [[ $# -gt 0 ]]; do
             case "$1" in
-              -d) TARGET="$2"; shift 2 ;;
               -w) WORDLIST="$2"; shift 2 ;;
-              -r|--resolvers) RESOLVERS="$2"; shift 2 ;;
-              -o) OUTDIR="$2"; shift 2 ;;
+              -l) SUBS_FILE="$2"; shift 2 ;;
               -t) THREADS="$2"; shift 2 ;;
               -R|--rate) RATE="$2"; shift 2 ;;
-              --mode) MODE="$2"; shift 2 ;;
-              --depth) RECURSION_DEPTH="$2"; shift 2 ;;
-              --perm) PERM_WORDLIST="$2"; shift 2 ;;
+              -o) OUTDIR="$2"; shift 2 ;;
+              -d) FEROX_DEPTH="$2"; shift 2 ;;
+              -T) TARGET_TIMEOUT="$2"; shift 2 ;;
+              -x) EXCLUDE_CODES="$2"; shift 2 ;;
+              --no-recursion) FEROX_RECURSION=0; shift ;;
               *) shift ;;
             esac
           done
@@ -172,107 +222,90 @@ jobs:
           TMP="$OUTDIR/.tmp"
           mkdir -p "$TMP"
 
-          dedupe () { if command -v anew >/dev/null 2>&1; then anew "$@"; else sort -u; fi; }
-
-          rate_guard () {
-            local base_rate=$1; shift
-            local rate=$base_rate fails=0
-            while true; do
-              "$@" -rate "$rate" 2>&1 | tee "$TMP/rate_guard.log"
-              if grep -qiE '429|403|REFUSED|SERVFAIL' "$TMP/rate_guard.log"; then
-                rate=$(( rate / 2 )); (( rate < 1 )) && rate=1
-                fails=$(( fails + 1 ))
-                sleep $(( 15 * fails ))
-                (( fails >= 3 )) && return 1
-              else
-                break
-              fi
-            done
+          # Fix: the old version only added https:// when a line had NO ':' or
+          # '/' anywhere, so "host:8080" or "host/path" were left schemeless and
+          # broke every downstream tool. Now it only checks the actual prefix.
+          clean_subs () {
+            tr -d '\r' < "$1" \
+              | sed -E 's/#.*$//; s/^[[:space:]]+//; s/[[:space:]]+$//' \
+              | sed -E '/^$/d' \
+              | while IFS= read -r line; do
+                  case "$line" in
+                    http://*|https://*) echo "$line" ;;
+                    *) echo "https://$line" ;;
+                  esac
+                done \
+              | sort -u
           }
 
-          echo "[*] Phase 1: Passive enumeration for $TARGET"
-          : > "$TMP/sub_all.txt"
-          command -v subfinder   >/dev/null && subfinder -d "$TARGET" -all -silent -o "$TMP/sub_subfinder.txt" 2>/dev/null || true
-          command -v assetfinder >/dev/null && assetfinder --subs-only "$TARGET" > "$TMP/sub_assetfinder.txt" 2>/dev/null || true
-          command -v amass       >/dev/null && amass enum -passive -d "$TARGET" -o "$TMP/sub_amass.txt" 2>/dev/null || true
+          dedupe () {
+            if command -v uro >/dev/null 2>&1; then uro | sort -u; else sort -u; fi
+          }
 
-          curl -s "https://crt.sh/?q=%25.$TARGET&output=json" | jq -r '.[].name_value' | sed 's/\*\.//g' | tr ',' '\n' | grep -oE "[A-Za-z0-9._-]+\.${TARGET}" | sort -u > "$TMP/sub_crt.txt" 2>/dev/null || true
-
-          find "$TMP" -maxdepth 1 -name 'sub_*.txt' -exec cat {} + 2>/dev/null | sed '/^$/d' | dedupe "$OUTDIR/passive_subs.txt" || touch "$OUTDIR/passive_subs.txt"
-          echo "[+] Passive: $(wc -l < "$OUTDIR/passive_subs.txt" | tr -d ' ') candidates"
-
-          cp "$OUTDIR/passive_subs.txt" "$OUTDIR/all_subs_raw.txt"
-          if [[ "$MODE" != "passive" ]]; then
-            echo "[*] Phase 2: Active bruteforce (puredns)"
-            # Verify puredns can find massdns before running
-            if ! puredns --help >/dev/null 2>&1; then
-              echo "❌ puredns command failed. It may not be able to find massdns."
-              exit 1
+          # Drops rows whose status code is in EXCLUDE_CODES, then keeps just the URL.
+          filter_codes () {
+            if [[ -n "$EXCLUDE_CODES" ]]; then
+              awk -F'\t' -v exclude=",${EXCLUDE_CODES}," '{ if (index(exclude, "," $2 ",") == 0) print $1 }'
+            else
+              awk -F'\t' '{ print $1 }'
             fi
-            timeout 600 puredns bruteforce "$WORDLIST" "$TARGET" -r "$RESOLVERS" -t "$THREADS" -o "$TMP/sub_bruteforce.txt" > /dev/null 2>&1 || true
-            find "$OUTDIR/passive_subs.txt" "$TMP/sub_bruteforce.txt" -type f -exec cat {} + 2>/dev/null | sed '/^$/d' | dedupe "$OUTDIR/all_subs_raw.txt" || touch "$OUTDIR/all_subs_raw.txt"
-          fi
-          echo "[+] Raw merged: $(wc -l < "$OUTDIR/all_subs_raw.txt" | tr -d ' ') candidates"
+          }
 
-          echo "[*] Phase 3: Resolve (dnsx)"
-          random_name="nonexistent-$(head -c 200 /dev/urandom | tr -dc a-z | head -c 8).$TARGET"
-          wildcard_ip=$(dig +short "$random_name" A 2>/dev/null | head -n1 || true)
-          if [[ -n "$wildcard_ip" ]]; then
-            dnsx -l "$OUTDIR/all_subs_raw.txt" -a -resp -silent -wd "$TARGET" -o "$TMP/resolved.txt" > /dev/null 2>&1 || true
-          else
-            dnsx -l "$OUTDIR/all_subs_raw.txt" -a -resp -silent -o "$TMP/resolved.txt" > /dev/null 2>&1 || true
-          fi
-          sed -E 's/[[:space:]].*$//' "$TMP/resolved.txt" 2>/dev/null | sed '/^$/d' | dedupe "$OUTDIR/resolved_subs.txt" || touch "$OUTDIR/resolved_subs.txt"
-          echo "[+] Resolved: $(wc -l < "$OUTDIR/resolved_subs.txt" | tr -d ' ') live subdomains"
+          CLEANED="$OUTDIR/subs.cleaned.txt"
+          clean_subs "$SUBS_FILE" > "$CLEANED"
 
-          if [[ "$MODE" == "full" && "$RECURSION_DEPTH" -gt 0 ]]; then
-            echo "[*] Phase 4: Recursion (depth=$RECURSION_DEPTH)"
-            if [[ -n "$PERM_WORDLIST" && -r "$PERM_WORDLIST" ]]; then
-              if command -v gotator >/dev/null 2>&1; then
-                gotator -sub "$OUTDIR/resolved_subs.txt" -perm "$PERM_WORDLIST" -depth "$RECURSION_DEPTH" -numbers 10 > "$TMP/permuted_candidates.txt" 2>/dev/null || true
-              elif command -v dnsgen >/dev/null 2>&1; then
-                input="$OUTDIR/resolved_subs.txt"
-                for ((i=1; i<=RECURSION_DEPTH; i++)); do dnsgen "$input" > "$TMP/perm_$i.txt" 2>/dev/null || true; input="$TMP/perm_$i.txt"; done
-                cat "$TMP"/perm_*.txt > "$TMP/permuted_candidates.txt" 2>/dev/null || true
-              fi
-              if [[ -s "$TMP/permuted_candidates.txt" ]]; then
-                rate_guard "$RATE" puredns resolve "$TMP/permuted_candidates.txt" -r "$RESOLVERS" -t "$THREADS" -o "$TMP/permuted_resolved.txt" > /dev/null 2>&1 || true
-                if [[ -s "$TMP/permuted_resolved.txt" ]]; then
-                  find "$OUTDIR/resolved_subs.txt" "$TMP/permuted_resolved.txt" -type f -exec cat {} + 2>/dev/null | sed '/^$/d' | dedupe "$TMP/resolved_with_recursion.txt" || true
-                  mv "$TMP/resolved_with_recursion.txt" "$OUTDIR/resolved_subs.txt" 2>/dev/null || true
-                fi
-              fi
-            fi
-          fi
+          while IFS= read -r entry; do
+            [[ -z "$entry" ]] && continue
+            url="$entry"
+            hash=$(printf '%s' "$url" | sha1sum | cut -c1-8)
+            safe="$(printf '%s' "$url" | sed -E 's#https?://##; s#[^A-Za-z0-9]+#_#g; s#_+$##')_${hash}"
+            base="$OUTDIR/$safe"
 
-          echo "[*] Phase 5: HTTP probing (httpx)"
-          httpx -l "$OUTDIR/resolved_subs.txt" -ports 80,443,8080,8443 -sc -title -tech-detect -cdn -silent -t "$THREADS" -rl "$RATE" -timeout 10 -o "$OUTDIR/live_hosts.txt" > /dev/null 2>&1 || true
-          echo "[+] Live HTTP hosts: $(wc -l < "$OUTDIR/live_hosts.txt" | tr -d ' ')"
+            echo "[*] target: $url (timeout ${TARGET_TIMEOUT}s per tool)"
+
+            ferox_args=(-u "$url" -w "$WORDLIST" -t "$THREADS" --rate-limit "$RATE" --scan-limit 2 --auto-tune --auto-bail --timeout 10 --json -o "${base}.ferox.jsonl" -q)
+            [[ "$FEROX_RECURSION" -eq 0 ]] && ferox_args+=( --no-recursion )
+            # Always pass -d explicitly when recursion is on — feroxbuster treats
+            # depth=0 as "unlimited", but the old script *omitted* -d for depth=0,
+            # which silently fell back to feroxbuster's own default depth instead.
+            [[ "$FEROX_RECURSION" -eq 1 ]] && ferox_args+=( --depth "$FEROX_DEPTH" )
+
+            timeout "${TARGET_TIMEOUT}s" feroxbuster "${ferox_args[@]}" >/dev/null 2>&1 || true
+
+            timeout "${TARGET_TIMEOUT}s" ffuf -w "$WORDLIST" -u "${url%/}/FUZZ" -t "$THREADS" -rate "$RATE" -timeout 10 -ac -of json -o "${base}.ffuf.json" -s >/dev/null 2>&1 || true
+
+            jq -r 'select(.type=="response") | [.url, (.status|tostring)] | @tsv' "${base}.ferox.jsonl" 2>/dev/null > "${TMP}/${safe}.ferox.tsv" || true
+            jq -r '.results[]? | [.url, (.status|tostring)] | @tsv' "${base}.ffuf.json" 2>/dev/null > "${TMP}/${safe}.ffuf.tsv" || true
+
+            cat "${TMP}/${safe}.ferox.tsv" "${TMP}/${safe}.ffuf.tsv" 2>/dev/null | sed '/^[[:space:]]*$/d' | filter_codes | dedupe > "${base}.urls.txt"
+          done < "$CLEANED"
+
+          MASTER="$OUTDIR/ALL_UNIQUE_URLS.txt"
+          cat "$OUTDIR"/*.urls.txt 2>/dev/null | sed '/^[[:space:]]*$/d' | dedupe > "$MASTER"
+          echo "[+] Master file: $MASTER"
           SCRIPT_EOF
 
           # 2. Make it executable
-          chmod +x subfuzz.sh
+          chmod +x fuzzall.sh
 
-          # 3. Debug: Print the first few lines of the generated script
-          echo "--- First 10 lines of generated script ---"
-          head -n 10 subfuzz.sh
-          echo "------------------------------------------"
+          # 3. Run it
+          TARGET_TIMEOUT_SECONDS=$(( TIMEOUT_MIN * 60 ))
+          ARGS=(-w wordlists/target.txt -l work/subs.txt -t "$THREADS" -R "$RATE" -o fuzz_out -T "$TARGET_TIMEOUT_SECONDS" -x "$EXCLUDE_CODES")
+          if [ "$RECURSION" = "off" ]; then
+            ARGS+=(--no-recursion)
+          else
+            ARGS+=(-d "$DEPTH")
+          fi
 
-          # 4. Run it
-          if [ -z "$TARGET" ]; then exit 1; fi
-          ARGS=(-d "$TARGET" -w wordlists/subdomains.txt -r resolvers.txt -t "$THREADS" -R "$RATE")
-          if [ "$MODE" = "passive" ]; then ARGS+=(--mode passive); fi
-          if [ "$MODE" = "full" ] && [ "$DEPTH" != "0" ]; then ARGS+=(--mode full --depth "$DEPTH" --perm wordlists/permutations.txt); fi
-          
-          echo "▶ ./subfuzz.sh ${ARGS[*]}"
-          ./subfuzz.sh "${ARGS[@]}"
+          echo "▶ ./fuzzall.sh ${ARGS[*]}"
+          ./fuzzall.sh "${ARGS[@]}"
 
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: subfuzz-${{ inputs.target }}-${{ github.run_id }}
-          path: subenum_out/
+          name: dirfuzz-${{ github.run_id }}
+          path: fuzz_out/
           retention-days: 30
           if-no-files-found: warn
 
@@ -282,32 +315,50 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           RUN_URL:            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          TARGET:             ${{ inputs.target }}
+          TARGET_COUNT:       ${{ steps.parse.outputs.count }}
+          JOB_STATUS:         ${{ job.status }}
         run: |
           if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then exit 0; fi
-          passive=0; resolved=0; live=0
-          [ -f subenum_out/passive_subs.txt ]  && passive=$(wc -l < subenum_out/passive_subs.txt)
-          [ -f subenum_out/resolved_subs.txt ] && resolved=$(wc -l < subenum_out/resolved_subs.txt)
-          [ -f subenum_out/live_hosts.txt ]    && live=$(wc -l < subenum_out/live_hosts.txt)
-          
-          MSG="🔍 SUBFUZZ — ${TARGET}%0A• Passive: ${passive}%0A• Resolved: ${resolved}%0A• Live: ${live}%0A🔗 ${RUN_URL}"
+          total=0; [ -f fuzz_out/ALL_UNIQUE_URLS.txt ] && total=$(wc -l < fuzz_out/ALL_UNIQUE_URLS.txt)
+
+          MSG="📂 DIR FUZZ — ${JOB_STATUS}
+• Targets: ${TARGET_COUNT}
+• Unique URLs: ${total}
+🔗 ${RUN_URL}"
+
+          # --data-urlencode handles newlines/special chars properly, unlike the
+          # old hand-built '%0A'-joined query string.
           curl -sS -o /dev/null -w '[+] Telegram: HTTP %{http_code}\n' \
             -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${TELEGRAM_CHAT_ID}&text=${MSG}" || true
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MSG}" || true
 
-      - name: Write summary
+      - name: Summary
         if: always()
+        shell: bash
+        env:
+          TARGET_COUNT:   ${{ steps.parse.outputs.count }}
+          WORDLIST_TIER:  ${{ inputs.wordlist }}
+          WORDLIST_LINES: ${{ steps.wl.outputs.lines }}
+          RECURSION:      ${{ inputs.recursion }}
+          DEPTH:          ${{ inputs.depth }}
         run: |
           {
-            echo "## Subdomain Fuzz — \`${{ inputs.target }}\`"
-            echo "| Mode | \`${{ inputs.mode }}\` |"
-            echo "| Depth | \`${{ inputs.depth }}\` |"
+            echo "## Directory Fuzz"
+            echo "| Targets | $TARGET_COUNT |"
+            echo "| Wordlist | \`$WORDLIST_TIER\` ($WORDLIST_LINES entries) |"
+            echo "| Recursion | \`$RECURSION\` |"
+            echo "| Depth | \`$DEPTH\` |"
             echo ""
-            if [ -f subenum_out/live_hosts.txt ]; then
-              echo "### ✅ Live hosts ($(wc -l < subenum_out/live_hosts.txt))"
-              echo '```'; head -50 subenum_out/live_hosts.txt; echo '```'
+            if [ -f fuzz_out/ALL_UNIQUE_URLS.txt ]; then
+              n=$(wc -l < fuzz_out/ALL_UNIQUE_URLS.txt | tr -d ' ')
+              echo "### ✅ Unique URLs: $n"
+              echo '```'; head -100 fuzz_out/ALL_UNIQUE_URLS.txt; echo '```'
             else
-              echo "### ⚠️ No results produced."
+              echo "### ⚠️ No results — \`fuzz_out/ALL_UNIQUE_URLS.txt\` not produced"
+              echo '```'
+              ls -la fuzz_out/ 2>/dev/null || echo "directory does not exist"
+              echo '```'
             fi
           } >> "$GITHUB_STEP_SUMMARY" || true
         continue-on-error: true
