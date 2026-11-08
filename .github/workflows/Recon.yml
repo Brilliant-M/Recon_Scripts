@@ -1,0 +1,239 @@
+name: Recon Pipeline
+
+# Manual trigger + optional weekly schedule (set the TARGET_DOMAIN repo variable for scheduled runs).
+# ONLY run this against targets you are authorized to test (in-scope bug bounty / VDP / your own assets).
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: "Target root domain (e.g. example.com) - must be in scope"
+        required: true
+        type: string
+      run_ports:
+        description: "Run port scan (naabu)"
+        type: boolean
+        default: true
+      run_crawl:
+        description: "Run crawl + JS analysis (katana)"
+        type: boolean
+        default: true
+      run_history:
+        description: "Run historical URLs (waybackurls + gau)"
+        type: boolean
+        default: true
+      run_fuzz:
+        description: "Run directory brute force (ffuf) + param discovery (arjun) - noisy"
+        type: boolean
+        default: false
+      max_fuzz_hosts:
+        description: "Max live hosts to fuzz with ffuf"
+        type: string
+        default: "20"
+  # schedule:
+  #   - cron: "0 3 * * 1"   # Mondays 03:00 UTC; uses vars.TARGET_DOMAIN
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recon-${{ github.event.inputs.domain || vars.TARGET_DOMAIN }}
+  cancel-in-progress: false
+
+env:
+  DOMAIN: ${{ github.event.inputs.domain || vars.TARGET_DOMAIN }}
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Validate domain
+        run: |
+          if [[ ! "$DOMAIN" =~ ^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$ ]]; then
+            echo "::error::Invalid domain: '$DOMAIN'"; exit 1
+          fi
+          echo "Target: $DOMAIN"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache Go tools
+        id: cache-tools
+        uses: actions/cache@v4
+        with:
+          path: ~/go/bin
+          key: recon-tools-${{ runner.os }}-v1
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libpcap-dev jq
+
+      - name: Install recon tools
+        if: steps.cache-tools.outputs.cache-hit != 'true'
+        run: |
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install -v github.com/tomnomnom/assetfinder@latest
+          go install -v github.com/owasp-amass/amass/v4/...@master
+          go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
+          go install -v github.com/projectdiscovery/katana/cmd/katana@latest
+          go install -v github.com/tomnomnom/waybackurls@latest
+          go install -v github.com/lc/gau/v2/cmd/gau@latest
+          go install -v github.com/ffuf/ffuf/v2@latest
+
+      - name: Add Go bin to PATH
+        run: echo "$HOME/go/bin" >> "$GITHUB_PATH"
+
+      - name: Prepare workspace
+        run: mkdir -p "recon/$DOMAIN"
+
+      # ---------- 1.1 Subdomain enumeration ----------
+      - name: "1.1 Subdomain enumeration"
+        working-directory: recon
+        run: |
+          cd "$DOMAIN"
+          subfinder -d "$DOMAIN" -all -silent > subs_subfinder.txt || true
+          assetfinder --subs-only "$DOMAIN" > subs_assetfinder.txt || true
+          timeout 20m amass enum -passive -d "$DOMAIN" -o subs_amass.txt || true
+          touch subs_subfinder.txt subs_assetfinder.txt subs_amass.txt
+          cat subs_*.txt | tr 'A-Z' 'a-z' | sed 's/^\*\.//' | sort -u > all_subs.txt
+          echo "[+] $(wc -l < all_subs.txt) unique subdomains found"
+
+      # ---------- 1.2 Resolve + probe ----------
+      - name: "1.2 Resolve and probe live hosts"
+        working-directory: recon
+        run: |
+          cd "$DOMAIN"
+          dnsx -l all_subs.txt -silent -a -resp > resolved_with_ips.txt || true
+          awk '{print $1}' resolved_with_ips.txt | sort -u > resolved.txt
+          httpx -l resolved.txt -silent -title -status-code -tech-detect -ip \
+            -o live_hosts.txt || true
+          touch live_hosts.txt
+          cut -d' ' -f1 live_hosts.txt | sort -u > urls.txt
+          sed -E 's~https?://~~; s~[:/].*$~~' urls.txt | sort -u > hosts_only.txt
+          echo "[+] $(wc -l < live_hosts.txt) live hosts"
+
+      # ---------- 1.3 Port scan ----------
+      - name: "1.3 Port scan"
+        if: github.event_name == 'schedule' || inputs.run_ports
+        working-directory: recon
+        run: |
+          cd "$DOMAIN"
+          # connect scan (-s c) since raw-socket SYN scans are unreliable on hosted runners
+          naabu -list hosts_only.txt -top-ports 1000 -s c -silent -o open_ports.txt || true
+          touch open_ports.txt
+          echo "[+] $(wc -l < open_ports.txt) open ports"
+
+      # ---------- 1.4 Crawl + JS ----------
+      - name: "1.4 Crawl and JS analysis"
+        if: github.event_name == 'schedule' || inputs.run_crawl
+        working-directory: recon
+        run: |
+          cd "$DOMAIN"
+          katana -list urls.txt -jc -d 3 -silent -o crawled_urls.txt || true
+          touch crawled_urls.txt
+          grep -E '\.js(\?.*)?$' crawled_urls.txt | sort -u > js_files.txt || true
+          touch js_files.txt
+
+          # download JS once (parallel), reuse for endpoint + secret extraction
+          mkdir -p js_dump
+          cat js_files.txt | head -n 2000 | xargs -P 10 -I{} sh -c \
+            'curl -sL --max-time 20 "{}" -o "js_dump/$(echo "{}" | md5sum | cut -d" " -f1).js" || true'
+          cat js_dump/*.js > all_js_content.txt 2>/dev/null || touch all_js_content.txt
+
+          # API-style endpoints
+          grep -oE "(\"|')(/api/[a-zA-Z0-9_/.\-]+)(\"|')" all_js_content.txt \
+            | tr -d "\"'" | sort -u > js_endpoints.txt || true
+          touch js_endpoints.txt
+
+          # secret-looking strings (REVIEW MANUALLY - expect false positives)
+          grep -oEi "(api[_-]?key|secret|token|aws_access_key_id)[\"']?\s*[:=]\s*[\"'][a-zA-Z0-9\-_]{10,}[\"']" \
+            all_js_content.txt | sort -u > possible_secrets.txt || true
+          touch possible_secrets.txt
+          rm -rf js_dump
+
+      # ---------- 1.5 Historical URLs ----------
+      - name: "1.5 Historical URLs"
+        if: github.event_name == 'schedule' || inputs.run_history
+        working-directory: recon
+        run: |
+          cd "$DOMAIN"
+          {
+            echo "$DOMAIN" | waybackurls
+            echo "$DOMAIN" | gau --threads 5
+            while read -r h; do
+              echo "$h" | waybackurls
+              echo "$h" | gau --threads 5
+            done < hosts_only.txt
+          } 2>/dev/null | sort -u > historical_urls.txt || true
+          touch historical_urls.txt
+          grep '?' historical_urls.txt \
+            | grep -viE "\.(png|jpg|jpeg|gif|css|svg|woff2?|ico)(\?|$)" \
+            > historical_params.txt || true
+          touch historical_params.txt
+          echo "[+] $(wc -l < historical_urls.txt) historical URLs"
+
+      # ---------- 1.6 Directory + parameter discovery ----------
+      - name: "1.6a Directory brute force (ffuf)"
+        if: inputs.run_fuzz
+        working-directory: recon
+        run: |
+          cd "$DOMAIN"
+          mkdir -p ffuf
+          curl -sL -o raft-medium-directories.txt \
+            https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-medium-directories.txt
+          head -n "${{ inputs.max_fuzz_hosts }}" urls.txt | while read -r url; do
+            ffuf -u "$url/FUZZ" -w raft-medium-directories.txt \
+              -mc 200,301,302,403 -t 50 -rate 100 -s \
+              -o "ffuf/ffuf_$(echo "$url" | md5sum | cut -d' ' -f1).json" -of json || true
+          done
+
+      - name: "1.6b Hidden parameters (arjun)"
+        if: inputs.run_fuzz
+        working-directory: recon
+        run: |
+          cd "$DOMAIN"
+          pip install -q arjun
+          # dedupe to one URL per path, cap at 200 to keep runtime sane
+          sed 's/?.*//' historical_params.txt | sort -u | head -n 200 > arjun_input.txt
+          [ -s arjun_input.txt ] && arjun -i arjun_input.txt -oT arjun_params.txt || true
+
+      # ---------- 1.7 Summary ----------
+      - name: "1.7 Summary"
+        working-directory: recon
+        run: |
+          cd "$DOMAIN"
+          count() { [ -f "$1" ] && wc -l < "$1" || echo 0; }
+          {
+            echo "## Recon complete for \`$DOMAIN\`"
+            echo ""
+            echo "| Metric | Count |"
+            echo "|---|---|"
+            echo "| Unique subdomains | $(count all_subs.txt) |"
+            echo "| Live hosts | $(count live_hosts.txt) |"
+            echo "| Open ports | $(count open_ports.txt) |"
+            echo "| Crawled URLs | $(count crawled_urls.txt) |"
+            echo "| JS files | $(count js_files.txt) |"
+            echo "| JS endpoints | $(count js_endpoints.txt) |"
+            echo "| Historical URLs | $(count historical_urls.txt) |"
+            echo "| Historical params | $(count historical_params.txt) |"
+            echo "| Possible secrets | $(count possible_secrets.txt) |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recon-${{ env.DOMAIN }}-${{ github.run_number }}
+          path: recon/${{ env.DOMAIN }}/
+          retention-days: 14
+          if-no-files-found: warn
