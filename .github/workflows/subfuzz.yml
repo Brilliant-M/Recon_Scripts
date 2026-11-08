@@ -123,7 +123,6 @@ jobs:
           DNSX_VER="v1.2.1"
           HTTPX_VER="v1.6.9"
           PUREDNS_VER="v2.1.1"
-          GOTATOR_VER="v1.2.0"
           AMASS_VER="v4.2.0"
 
           go install "github.com/projectdiscovery/subfinder/v2/cmd/subfinder@${SUBFINDER_VER}"
@@ -132,7 +131,8 @@ jobs:
           # No tagged releases worth pinning to — left on @latest intentionally.
           go install github.com/tomnomnom/assetfinder@latest
           go install "github.com/d3mondev/puredns/v2@${PUREDNS_VER}"
-          go install "github.com/Josue87/gotator@${GOTATOR_VER}"
+          # gotator publishes no semver tags (v1.2.0 does not exist) — its README says to use @latest.
+          go install github.com/Josue87/gotator@latest
           go install "github.com/owasp-amass/amass/v4/...@${AMASS_VER}" || echo "amass install failed (optional)"
           echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
