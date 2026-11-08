@@ -340,11 +340,7 @@ jobs:
           [ -f subenum_out/resolved_subs.txt ] && resolved=$(wc -l < subenum_out/resolved_subs.txt)
           [ -f subenum_out/live_hosts.txt ]    && live=$(wc -l < subenum_out/live_hosts.txt)
 
-          MSG="🔍 SUBFUZZ — ${TARGET}
-• Passive: ${passive}
-• Resolved: ${resolved}
-• Live: ${live}
-🔗 ${RUN_URL}"
+          MSG=$'🔍 SUBFUZZ \xe2\x80\x94 '"${TARGET}"$'\n• Passive: '"${passive}"$'\n• Resolved: '"${resolved}"$'\n• Live: '"${live}"$'\n🔗 '"${RUN_URL}"
 
           # --data-urlencode instead of hand-built '%0A' string — handles
           # newlines/special characters correctly.
