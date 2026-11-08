@@ -29,7 +29,16 @@ on:
         required: false
         type: string
         default: '20'
+      phase_timeout_minutes:
+        description: 'Max minutes per phase (dnsx/httpx/recursion) before it is killed (default 15)'
+        required: false
+        type: string
+        default: '15'
 
+# NOTE: concurrency.group is evaluated before any step runs, so it can only see
+# the raw input — it can't be lowercased here. "Example.com" and "example.com"
+# will therefore get separate queues. Not fixable without a wrapper workflow;
+# flagging it rather than hiding it.
 concurrency:
   group: subfuzz-${{ inputs.target }}
   cancel-in-progress: false
@@ -46,6 +55,33 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
+
+      # Everything free-text (target, threads, rate, phase_timeout_minutes) is
+      # checked here and, from this point on, passed via `env:` + `$VAR` rather
+      # than spliced straight into run: text. The original workflow did this
+      # correctly in the "Generate and Run" step but NOT in "Write summary",
+      # where `${{ inputs.target }}` was interpolated directly into shell text —
+      # a script-injection hole, since `target` is free text a user types in.
+      - name: Validate inputs
+        env:
+          TARGET:  ${{ inputs.target }}
+          THREADS: ${{ inputs.threads }}
+          RATE:    ${{ inputs.rate }}
+          PHASE_TIMEOUT_MIN: ${{ inputs.phase_timeout_minutes }}
+        run: |
+          set -euo pipefail
+          err() { echo "❌ $1"; exit 1; }
+
+          [[ "$THREADS" =~ ^[0-9]+$ ]] || err "threads must be a positive integer"
+          [[ "$RATE"    =~ ^[0-9]+$ ]] || err "rate must be a positive integer"
+          [[ "$PHASE_TIMEOUT_MIN" =~ ^[0-9]+$ ]] || err "phase_timeout_minutes must be a positive integer"
+
+          DOMAIN_RE='^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
+          [[ "$TARGET" =~ $DOMAIN_RE ]] || err "target does not look like a valid root domain: $TARGET"
+
+          # Normalize case for the rest of the job (concurrency.group above can't use this — see note).
+          echo "TARGET_NORM=$(echo "$TARGET" | tr 'A-Z' 'a-z')" >> "$GITHUB_ENV"
+          echo "✅ inputs OK"
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -66,7 +102,11 @@ jobs:
 
       - name: Install massdns
         run: |
-          git clone --depth 1 https://github.com/blechschmidt/massdns.git /tmp/massdns
+          # Pinned to a tag instead of the default branch HEAD — bump deliberately.
+          # (Verify this tag still exists before relying on it; massdns tags infrequently.)
+          MASSDNS_REF="v1.0.0"
+          git clone --depth 1 --branch "$MASSDNS_REF" https://github.com/blechschmidt/massdns.git /tmp/massdns || \
+            git clone --depth 1 https://github.com/blechschmidt/massdns.git /tmp/massdns
           cd /tmp/massdns
           make -j
           sudo make install
@@ -75,13 +115,23 @@ jobs:
       - name: Install Go tools
         run: |
           export PATH="$PATH:$(go env GOPATH)/bin"
-          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-          go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
-          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          # Pinned versions instead of @latest/@master for reproducibility.
+          # Verify these tags against each project's releases page before trusting them long-term.
+          SUBFINDER_VER="v2.6.6"
+          DNSX_VER="v1.2.1"
+          HTTPX_VER="v1.6.9"
+          PUREDNS_VER="v2.1.1"
+          GOTATOR_VER="v1.2.0"
+          AMASS_VER="v4.2.0"
+
+          go install "github.com/projectdiscovery/subfinder/v2/cmd/subfinder@${SUBFINDER_VER}"
+          go install "github.com/projectdiscovery/dnsx/cmd/dnsx@${DNSX_VER}"
+          go install "github.com/projectdiscovery/httpx/cmd/httpx@${HTTPX_VER}"
+          # No tagged releases worth pinning to — left on @latest intentionally.
           go install github.com/tomnomnom/assetfinder@latest
-          go install github.com/d3mondev/puredns/v2@latest
-          go install github.com/Josue87/gotator@latest
-          go install github.com/owasp-amass/amass/v4/...@master || echo "amass install failed (optional)"
+          go install "github.com/d3mondev/puredns/v2@${PUREDNS_VER}"
+          go install "github.com/Josue87/gotator@${GOTATOR_VER}"
+          go install "github.com/owasp-amass/amass/v4/...@${AMASS_VER}" || echo "amass install failed (optional)"
           echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
       - name: Install dnsgen
@@ -103,8 +153,8 @@ jobs:
       - name: Download wordlists
         run: |
           mkdir -p wordlists
-          curl -fsSL https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-5000.txt -o wordlists/subdomains.txt
-          curl -fsSL https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/dns-Jhaddix.txt -o wordlists/permutations.txt
+          curl -fsSL --max-time 60 https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-5000.txt -o wordlists/subdomains.txt
+          curl -fsSL --max-time 60 https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/dns-Jhaddix.txt -o wordlists/permutations.txt
           wc -l wordlists/subdomains.txt wordlists/permutations.txt
           test -s wordlists/subdomains.txt
           test -s wordlists/permutations.txt
@@ -114,7 +164,7 @@ jobs:
           export PATH="$PATH:$(go env GOPATH)/bin"
           if ! puredns init; then
             echo "puredns init failed — falling back to trickest/resolvers"
-            curl -fsSL https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt -o resolvers.txt
+            curl -fsSL --max-time 60 https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt -o resolvers.txt
           fi
           test -s resolvers.txt
           echo "resolvers.txt lines: $(wc -l < resolvers.txt)"
@@ -124,11 +174,12 @@ jobs:
       # ==========================================
       - name: Generate and Run subfuzz.sh
         env:
-          TARGET:  ${{ inputs.target }}
+          TARGET:  ${{ env.TARGET_NORM }}
           MODE:    ${{ inputs.mode }}
           DEPTH:   ${{ inputs.depth }}
           THREADS: ${{ inputs.threads }}
           RATE:    ${{ inputs.rate }}
+          PHASE_TIMEOUT_MIN: ${{ inputs.phase_timeout_minutes }}
         run: |
           export PATH="$PATH:$HOME/go/bin"
 
@@ -146,6 +197,7 @@ jobs:
           PERM_WORDLIST=""
           THREADS=20
           RATE=20
+          PHASE_TIMEOUT=900
 
           while [[ $# -gt 0 ]]; do
             case "$1" in
@@ -158,6 +210,7 @@ jobs:
               --mode) MODE="$2"; shift 2 ;;
               --depth) RECURSION_DEPTH="$2"; shift 2 ;;
               --perm) PERM_WORDLIST="$2"; shift 2 ;;
+              --phase-timeout) PHASE_TIMEOUT="$2"; shift 2 ;;
               *) shift ;;
             esac
           done
@@ -168,11 +221,15 @@ jobs:
 
           dedupe () { if command -v anew >/dev/null 2>&1; then anew "$@"; else sort -u; fi; }
 
+          # Fix: puredns' actual rate-limit flag is --rate-limit, not -rate.
+          # The old version passed "-rate N", which puredns would reject as an
+          # unknown flag — meaning this retry/backoff logic silently never worked
+          # (the failure was swallowed by the surrounding `|| true` elsewhere).
           rate_guard () {
             local base_rate=$1; shift
             local rate=$base_rate fails=0
             while true; do
-              "$@" -rate "$rate" 2>&1 | tee "$TMP/rate_guard.log"
+              "$@" --rate-limit "$rate" 2>&1 | tee "$TMP/rate_guard.log"
               if grep -qiE '429|403|REFUSED|SERVFAIL' "$TMP/rate_guard.log"; then
                 rate=$(( rate / 2 )); (( rate < 1 )) && rate=1
                 fails=$(( fails + 1 ))
@@ -186,11 +243,11 @@ jobs:
 
           echo "[*] Phase 1: Passive enumeration for $TARGET"
           : > "$TMP/sub_all.txt"
-          command -v subfinder   >/dev/null && subfinder -d "$TARGET" -all -silent -o "$TMP/sub_subfinder.txt" 2>/dev/null || true
-          command -v assetfinder >/dev/null && assetfinder --subs-only "$TARGET" > "$TMP/sub_assetfinder.txt" 2>/dev/null || true
-          command -v amass       >/dev/null && amass enum -passive -d "$TARGET" -o "$TMP/sub_amass.txt" 2>/dev/null || true
+          command -v subfinder   >/dev/null && timeout "${PHASE_TIMEOUT}s" subfinder -d "$TARGET" -all -silent -o "$TMP/sub_subfinder.txt" 2>/dev/null || true
+          command -v assetfinder >/dev/null && timeout "${PHASE_TIMEOUT}s" assetfinder --subs-only "$TARGET" > "$TMP/sub_assetfinder.txt" 2>/dev/null || true
+          command -v amass       >/dev/null && timeout "${PHASE_TIMEOUT}s" amass enum -passive -d "$TARGET" -o "$TMP/sub_amass.txt" 2>/dev/null || true
 
-          curl -s "https://crt.sh/?q=%25.$TARGET&output=json" | jq -r '.[].name_value' | sed 's/\*\.//g' | tr ',' '\n' | grep -oE "[A-Za-z0-9._-]+\.${TARGET}" | sort -u > "$TMP/sub_crt.txt" 2>/dev/null || true
+          curl -s --max-time 60 "https://crt.sh/?q=%25.$TARGET&output=json" | jq -r '.[].name_value' | sed 's/\*\.//g' | tr ',' '\n' | grep -oE "[A-Za-z0-9._-]+\.${TARGET}" | sort -u > "$TMP/sub_crt.txt" 2>/dev/null || true
 
           find "$TMP" -maxdepth 1 -name 'sub_*.txt' -exec cat {} + 2>/dev/null | sed '/^$/d' | dedupe "$OUTDIR/passive_subs.txt" || touch "$OUTDIR/passive_subs.txt"
           echo "[+] Passive: $(wc -l < "$OUTDIR/passive_subs.txt" | tr -d ' ') candidates"
@@ -198,7 +255,10 @@ jobs:
           cp "$OUTDIR/passive_subs.txt" "$OUTDIR/all_subs_raw.txt"
           if [[ "$MODE" != "passive" ]]; then
             echo "[*] Phase 2: Active bruteforce (puredns)"
-            timeout 600 puredns bruteforce "$WORDLIST" "$TARGET" -r "$RESOLVERS" -t "$THREADS" -o "$TMP/sub_bruteforce.txt" > /dev/null 2>&1 || true
+            # Fix: RATE was accepted as an input but never actually applied to the
+            # brute-force call, so the "rate" setting did nothing on the phase that
+            # hits target DNS infra hardest. Now honored via --rate-limit.
+            timeout 600 puredns bruteforce "$WORDLIST" "$TARGET" -r "$RESOLVERS" -t "$THREADS" --rate-limit "$RATE" -o "$TMP/sub_bruteforce.txt" > /dev/null 2>&1 || true
             find "$OUTDIR/passive_subs.txt" "$TMP/sub_bruteforce.txt" -type f -exec cat {} + 2>/dev/null | sed '/^$/d' | dedupe "$OUTDIR/all_subs_raw.txt" || touch "$OUTDIR/all_subs_raw.txt"
           fi
           echo "[+] Raw merged: $(wc -l < "$OUTDIR/all_subs_raw.txt" | tr -d ' ') candidates"
@@ -207,9 +267,9 @@ jobs:
           random_name="nonexistent-$(head -c 200 /dev/urandom | tr -dc a-z | head -c 8).$TARGET"
           wildcard_ip=$(dig +short "$random_name" A 2>/dev/null | head -n1 || true)
           if [[ -n "$wildcard_ip" ]]; then
-            dnsx -l "$OUTDIR/all_subs_raw.txt" -a -resp -silent -wd "$TARGET" -o "$TMP/resolved.txt" > /dev/null 2>&1 || true
+            timeout "${PHASE_TIMEOUT}s" dnsx -l "$OUTDIR/all_subs_raw.txt" -a -resp -silent -wd "$TARGET" -o "$TMP/resolved.txt" > /dev/null 2>&1 || true
           else
-            dnsx -l "$OUTDIR/all_subs_raw.txt" -a -resp -silent -o "$TMP/resolved.txt" > /dev/null 2>&1 || true
+            timeout "${PHASE_TIMEOUT}s" dnsx -l "$OUTDIR/all_subs_raw.txt" -a -resp -silent -o "$TMP/resolved.txt" > /dev/null 2>&1 || true
           fi
           sed -E 's/[[:space:]].*$//' "$TMP/resolved.txt" 2>/dev/null | sed '/^$/d' | dedupe "$OUTDIR/resolved_subs.txt" || touch "$OUTDIR/resolved_subs.txt"
           echo "[+] Resolved: $(wc -l < "$OUTDIR/resolved_subs.txt" | tr -d ' ') live subdomains"
@@ -218,14 +278,14 @@ jobs:
             echo "[*] Phase 4: Recursion (depth=$RECURSION_DEPTH)"
             if [[ -n "$PERM_WORDLIST" && -r "$PERM_WORDLIST" ]]; then
               if command -v gotator >/dev/null 2>&1; then
-                gotator -sub "$OUTDIR/resolved_subs.txt" -perm "$PERM_WORDLIST" -depth "$RECURSION_DEPTH" -numbers 10 > "$TMP/permuted_candidates.txt" 2>/dev/null || true
+                timeout "${PHASE_TIMEOUT}s" gotator -sub "$OUTDIR/resolved_subs.txt" -perm "$PERM_WORDLIST" -depth "$RECURSION_DEPTH" -numbers 10 > "$TMP/permuted_candidates.txt" 2>/dev/null || true
               elif command -v dnsgen >/dev/null 2>&1; then
                 input="$OUTDIR/resolved_subs.txt"
-                for ((i=1; i<=RECURSION_DEPTH; i++)); do dnsgen "$input" > "$TMP/perm_$i.txt" 2>/dev/null || true; input="$TMP/perm_$i.txt"; done
+                for ((i=1; i<=RECURSION_DEPTH; i++)); do timeout "${PHASE_TIMEOUT}s" dnsgen "$input" > "$TMP/perm_$i.txt" 2>/dev/null || true; input="$TMP/perm_$i.txt"; done
                 cat "$TMP"/perm_*.txt > "$TMP/permuted_candidates.txt" 2>/dev/null || true
               fi
               if [[ -s "$TMP/permuted_candidates.txt" ]]; then
-                rate_guard "$RATE" puredns resolve "$TMP/permuted_candidates.txt" -r "$RESOLVERS" -t "$THREADS" -o "$TMP/permuted_resolved.txt" > /dev/null 2>&1 || true
+                timeout "${PHASE_TIMEOUT}s" rate_guard "$RATE" puredns resolve "$TMP/permuted_candidates.txt" -r "$RESOLVERS" -t "$THREADS" -o "$TMP/permuted_resolved.txt" > /dev/null 2>&1 || true
                 if [[ -s "$TMP/permuted_resolved.txt" ]]; then
                   find "$OUTDIR/resolved_subs.txt" "$TMP/permuted_resolved.txt" -type f -exec cat {} + 2>/dev/null | sed '/^$/d' | dedupe "$TMP/resolved_with_recursion.txt" || true
                   mv "$TMP/resolved_with_recursion.txt" "$OUTDIR/resolved_subs.txt" 2>/dev/null || true
@@ -235,7 +295,7 @@ jobs:
           fi
 
           echo "[*] Phase 5: HTTP probing (httpx)"
-          httpx -l "$OUTDIR/resolved_subs.txt" -ports 80,443,8080,8443 -sc -title -tech-detect -cdn -silent -t "$THREADS" -rl "$RATE" -timeout 10 -o "$OUTDIR/live_hosts.txt" > /dev/null 2>&1 || true
+          timeout "${PHASE_TIMEOUT}s" httpx -l "$OUTDIR/resolved_subs.txt" -ports 80,443,8080,8443 -sc -title -tech-detect -cdn -silent -t "$THREADS" -rl "$RATE" -timeout 10 -o "$OUTDIR/live_hosts.txt" > /dev/null 2>&1 || true
           echo "[+] Live HTTP hosts: $(wc -l < "$OUTDIR/live_hosts.txt" | tr -d ' ')"
           SCRIPT_EOF
 
@@ -249,10 +309,11 @@ jobs:
 
           # 4. Run it
           if [ -z "$TARGET" ]; then exit 1; fi
-          ARGS=(-d "$TARGET" -w wordlists/subdomains.txt -r resolvers.txt -t "$THREADS" -R "$RATE")
+          PHASE_TIMEOUT_SECONDS=$(( PHASE_TIMEOUT_MIN * 60 ))
+          ARGS=(-d "$TARGET" -w wordlists/subdomains.txt -r resolvers.txt -t "$THREADS" -R "$RATE" --phase-timeout "$PHASE_TIMEOUT_SECONDS")
           if [ "$MODE" = "passive" ]; then ARGS+=(--mode passive); fi
           if [ "$MODE" = "full" ] && [ "$DEPTH" != "0" ]; then ARGS+=(--mode full --depth "$DEPTH" --perm wordlists/permutations.txt); fi
-          
+
           echo "▶ ./subfuzz.sh ${ARGS[*]}"
           ./subfuzz.sh "${ARGS[@]}"
 
@@ -271,26 +332,38 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           RUN_URL:            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          TARGET:             ${{ inputs.target }}
+          TARGET:             ${{ env.TARGET_NORM }}
         run: |
           if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then exit 0; fi
           passive=0; resolved=0; live=0
           [ -f subenum_out/passive_subs.txt ]  && passive=$(wc -l < subenum_out/passive_subs.txt)
           [ -f subenum_out/resolved_subs.txt ] && resolved=$(wc -l < subenum_out/resolved_subs.txt)
           [ -f subenum_out/live_hosts.txt ]    && live=$(wc -l < subenum_out/live_hosts.txt)
-          
-          MSG="🔍 SUBFUZZ — ${TARGET}%0A• Passive: ${passive}%0A• Resolved: ${resolved}%0A• Live: ${live}%0A🔗 ${RUN_URL}"
+
+          MSG="🔍 SUBFUZZ — ${TARGET}
+• Passive: ${passive}
+• Resolved: ${resolved}
+• Live: ${live}
+🔗 ${RUN_URL}"
+
+          # --data-urlencode instead of hand-built '%0A' string — handles
+          # newlines/special characters correctly.
           curl -sS -o /dev/null -w '[+] Telegram: HTTP %{http_code}\n' \
             -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${TELEGRAM_CHAT_ID}&text=${MSG}" || true
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MSG}" || true
 
       - name: Write summary
         if: always()
+        env:
+          TARGET: ${{ env.TARGET_NORM }}
+          MODE:   ${{ inputs.mode }}
+          DEPTH:  ${{ inputs.depth }}
         run: |
           {
-            echo "## Subdomain Fuzz — \`${{ inputs.target }}\`"
-            echo "| Mode | \`${{ inputs.mode }}\` |"
-            echo "| Depth | \`${{ inputs.depth }}\` |"
+            echo "## Subdomain Fuzz — \`$TARGET\`"
+            echo "| Mode | \`$MODE\` |"
+            echo "| Depth | \`$DEPTH\` |"
             echo ""
             if [ -f subenum_out/live_hosts.txt ]; then
               echo "### ✅ Live hosts ($(wc -l < subenum_out/live_hosts.txt))"
