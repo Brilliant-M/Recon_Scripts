@@ -163,7 +163,7 @@ jobs:
           mkdir -p wordlists
           case "$WORDLIST_TIER" in
             quick)    URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt" ;;
-            standard) URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/directory-list-2.3-medium.txt" ;;
+            standard) URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/DirBuster-2007_directory-list-2.3-medium.txt" ;;
             deep)     URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-large-directories.txt" ;;
             custom)   URL="$CUSTOM_WORDLIST" ;;
           esac
