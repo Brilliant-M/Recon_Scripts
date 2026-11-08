@@ -124,10 +124,26 @@ jobs:
 
       - name: Install feroxbuster
         run: |
+          set -euo pipefail
           mkdir -p "$HOME/.local/bin"
-          # Pinned to a tag instead of `main` — bump deliberately when you want to upgrade.
-          FEROX_REF="v2.10.1"
-          curl -sL "https://raw.githubusercontent.com/epi052/feroxbuster/${FEROX_REF}/install-nix.sh" | bash -s "$HOME/.local/bin"
+          cd "$(mktemp -d)"
+
+          # The upstream install-nix.sh always pulls "releases/latest" regardless of
+          # which script tag you fetch, and failed silently here (no zip downloaded,
+          # then unzip failed). Download the release asset directly instead, with
+          # curl -f so a failed download is a loud error, not a silent one.
+          # Try the pinned tag first, then latest, then build from source as a last resort.
+          FEROX_VER="v2.10.1"   # pinned; bump deliberately
+          ASSET="x86_64-linux-feroxbuster.zip"
+          if curl -fsSL -o ferox.zip "https://github.com/epi052/feroxbuster/releases/download/${FEROX_VER}/${ASSET}" \
+             || curl -fsSL -o ferox.zip "https://github.com/epi052/feroxbuster/releases/latest/download/${ASSET}"; then
+            unzip -o ferox.zip -d "$HOME/.local/bin"
+            chmod +x "$HOME/.local/bin/feroxbuster"
+          else
+            echo "release download failed — falling back to cargo install (slower)"
+            cargo install feroxbuster --locked --root "$HOME/.local"
+          fi
+
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/feroxbuster" --version
 
