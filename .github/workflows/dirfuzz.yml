@@ -321,10 +321,7 @@ jobs:
           if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then exit 0; fi
           total=0; [ -f fuzz_out/ALL_UNIQUE_URLS.txt ] && total=$(wc -l < fuzz_out/ALL_UNIQUE_URLS.txt)
 
-          MSG="📂 DIR FUZZ — ${JOB_STATUS}
-• Targets: ${TARGET_COUNT}
-• Unique URLs: ${total}
-🔗 ${RUN_URL}"
+          MSG=$'📂 DIR FUZZ \xe2\x80\x94 '"${JOB_STATUS}"$'\n• Targets: '"${TARGET_COUNT}"$'\n• Unique URLs: '"${total}"$'\n🔗 '"${RUN_URL}"
 
           # --data-urlencode handles newlines/special chars properly, unlike the
           # old hand-built '%0A'-joined query string.
