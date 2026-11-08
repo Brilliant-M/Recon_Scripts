@@ -52,10 +52,10 @@ on:
         type: string
         default: '20'
       rate:
-        description: 'Max req/sec (empty = auto)'
+        description: 'Max req/sec (default 20)'
         required: false
         type: string
-        default: ''
+        default: '20'
 
 concurrency:
   group: filefuzz-${{ github.run_id }}
@@ -73,11 +73,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
-
-      - name: Verify scripts exist
-        run: |
-          test -f filefuzz.sh || { echo "❌ filefuzz.sh missing"; exit 1; }
-          echo "✅ filefuzz.sh present"
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -146,12 +141,10 @@ jobs:
           cat work/subs.txt
           test -s work/subs.txt
 
-      - name: Make script executable
-        run: |
-          test -f filefuzz.sh || { echo "❌ filefuzz.sh missing"; exit 1; }
-          chmod +x filefuzz.sh
-
-      - name: Run file & extension fuzz
+      # ==========================================
+      # THIS STEP BUILDS AND RUNS THE SCRIPT
+      # ==========================================
+      - name: Generate and Run filefuzz.sh
         env:
           THREADS:    ${{ inputs.threads }}
           RATE_IN:    ${{ inputs.rate }}
@@ -162,15 +155,145 @@ jobs:
           TRIAGE:     ${{ inputs.triage }}
           TIME_LIMIT: ${{ inputs.time_limit }}
         run: |
-          set -euo pipefail
+          # 1. Write the bash script to a file on the runner
+          cat > filefuzz.sh << 'SCRIPT_EOF'
+          #!/usr/bin/env bash
+          set -uo pipefail
+
+          TARGETS_FILE=""
+          SINGLE=""
+          WORDLIST=""
+          OUTDIR="./filefuzz_out"
+          THREADS=20
+          RATE=20
+          EXT_SET="all"
+          CUSTOM_EXT=""
+          DO_SCHEME_CHECK=1
+          DO_TRIAGE=1
+          FORCE_EXT=0
+          MAX_TIME=""
+
+          declare -A EXT_SETS
+          EXT_SETS[web]="php,html,htm,txt,js,json,xml,css,jpg,png,gif,svg,pdf"
+          EXT_SETS[backup]="bak,backup,old,orig,save,swp,tmp,1,copy,sav,bk,bkp,ghost,dist"
+          EXT_SETS[config]="env,config,conf,ini,yml,yaml,properties,log,sql,db,sqlite,ds_store"
+          EXT_SETS[source]="php,php3,php4,php5,phtml,phps,asp,aspx,jsp,jspx,py,rb,pl,sh"
+          EXT_SETS[archive]="zip,tar,gz,tgz,7z,rar,war,jar"
+          EXT_SETS[all]="${EXT_SETS[web]},${EXT_SETS[backup]},${EXT_SETS[config]},${EXT_SETS[archive]}"
+
+          while [[ $# -gt 0 ]]; do
+            case "$1" in
+              -w) WORDLIST="$2"; shift 2 ;;
+              -l) TARGETS_FILE="$2"; shift 2 ;;
+              -u) SINGLE="$2"; shift 2 ;;
+              -o) OUTDIR="$2"; shift 2 ;;
+              -t) THREADS="$2"; shift 2 ;;
+              -r) RATE="$2"; shift 2 ;;
+              -e) EXT_SET="$2"; shift 2 ;;
+              --ext) CUSTOM_EXT="$2"; shift 2 ;;
+              --force-ext) FORCE_EXT=1; shift ;;
+              --time) MAX_TIME="$2"; shift 2 ;;
+              --no-triage) DO_TRIAGE=0; shift ;;
+              --no-scheme-check) DO_SCHEME_CHECK=0; shift ;;
+              *) shift ;;
+            esac
+          done
+
+          mkdir -p "$OUTDIR"
+          TMP="$OUTDIR/.tmp"
+          mkdir -p "$TMP"
+
+          if [[ -n "$CUSTOM_EXT" ]]; then
+            EXT_LIST=$(echo "$CUSTOM_EXT" | tr -d ' ')
+          elif [[ -n "${EXT_SETS[$EXT_SET]+x}" ]]; then
+            EXT_LIST="${EXT_SETS[$EXT_SET]}"
+          else
+            EXT_LIST="${EXT_SETS[all]}"
+          fi
+
+          FFUF_EXTS=$(echo "$EXT_LIST" | sed 's/[^,]*/\.&/g')
+          FEROX_EXTS="$EXT_LIST"
+
+          clean_subs () {
+            tr -d '\r' < "$1" | sed -E 's/#.*$//; s/^[[:space:]]+//; s/[[:space:]]+$//' | sed -E '/^$/d' | sed -E 's#^([^:/]+)$#https://\1#' | sort -u
+          }
+
+          resolve_scheme () {
+            local host="$1" code
+            code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "https://$host" 2>/dev/null || echo 000)
+            if [[ "$code" =~ ^(2|3) ]]; then echo "https://$host"; return; fi
+            code=$(curl -s  -o /dev/null -w '%{http_code}' --max-time 5 "http://$host"  2>/dev/null || echo 000)
+            if [[ "$code" =~ ^(2|3) ]]; then echo "http://$host";  return; fi
+            echo ""
+          }
+
+          dedupe () {
+            if command -v uro >/dev/null 2>&1; then uro | sort -u; else sort -u; fi
+          }
+
+          run_target () {
+            local url="$1"
+            local safe=$(printf '%s' "$url" | sed -E 's#https?://##; s#[/:?&=]#_#g; s#_+$##')
+            local base="$OUTDIR/$safe"
+
+            local ferox_args=(-u "$url" -w "$WORDLIST" -x "$FEROX_EXTS" -t "$THREADS" --rate-limit "$RATE" --scan-limit 2 --auto-tune --auto-bail --timeout 10 --json -o "${base}.ferox.jsonl" -q)
+            [[ "$FORCE_EXT" -eq 1 ]] && ferox_args+=( --force-extensions )
+            [[ -n "$MAX_TIME" ]]     && ferox_args+=( --time-limit "$MAX_TIME" )
+
+            feroxbuster "${ferox_args[@]}" >/dev/null 2>&1 || true
+
+            ffuf -w "$WORDLIST" -u "${url%/}/FUZZ" -e "$FFUF_EXTS" -t "$THREADS" -rate "$RATE" -timeout 10 -ac -of json -o "${base}.ffuf.json" -s >/dev/null 2>&1 || true
+
+            jq -r '.url // empty' "${base}.ferox.jsonl" 2>/dev/null > "${TMP}/${safe}.ferox.urls" || true
+            jq -r '.results[]?.url // empty' "${base}.ffuf.json" 2>/dev/null > "${TMP}/${safe}.ffuf.urls" || true
+
+            cat "${TMP}/${safe}.ferox.urls" "${TMP}/${safe}.ffuf.urls" 2>/dev/null | sed '/^[[:space:]]*$/d' | dedupe > "${base}.urls.txt"
+          }
+
+          if [[ -n "$SINGLE" ]]; then
+            url="$SINGLE"
+            [[ "$url" != http* ]] && url="https://$url"
+            run_target "$url"
+          else
+            CLEANED="$OUTDIR/subs.cleaned.txt"
+            clean_subs "$TARGETS_FILE" > "$CLEANED"
+            while IFS= read -r entry; do
+              [[ -z "$entry" ]] && continue
+              if [[ "$DO_SCHEME_CHECK" -eq 1 ]]; then
+                host="${entry#*://}"
+                url=$(resolve_scheme "$host")
+                if [[ -z "$url" ]]; then continue; fi
+              else
+                url="$entry"
+              fi
+              run_target "$url"
+            done < "$CLEANED"
+          fi
+
+          MASTER="$OUTDIR/ALL_UNIQUE_FILES.txt"
+          if compgen -G "$OUTDIR/*.urls.txt" >/dev/null; then
+            cat "$OUTDIR"/*.urls.txt | sed '/^[[:space:]]*$/d' | dedupe > "$MASTER"
+            echo "[+] Master file: $MASTER ($(wc -l < "$MASTER" | tr -d ' ') URLs)"
+          fi
+
+          if [[ "$DO_TRIAGE" -eq 1 ]] && command -v httpx >/dev/null 2>&1 && [[ -s "$MASTER" ]]; then
+            httpx -l "$MASTER" -sc -title -tech-detect -content-type -location -t "$THREADS" -rl "$RATE" -timeout 10 -silent -o "$OUTDIR/triage_all.txt" 2>/dev/null || true
+            grep -E '\[(200|201|301|302|401|403)\]' "$OUTDIR/triage_all.txt" | sort -u > "$OUTDIR/triage_interesting.txt" 2>/dev/null || true
+            grep -iE '\.(bak|backup|old|orig|save|swp|tmp|env|config|conf|ini|yml|yaml|properties|log|sql|db|sqlite|zip|tar|gz|tgz|7z|rar|git|svn)(\?|$|#)' "$OUTDIR/triage_interesting.txt" > "$OUTDIR/triage_sensitive.txt" 2>/dev/null || true
+          fi
+          SCRIPT_EOF
+
+          # 2. Make it executable
+          chmod +x filefuzz.sh
+
+          # 3. Run it
           RATE="$RATE_IN"
           if [ -z "$RATE" ]; then
             case "$WL_TIER" in quick) RATE=20 ;; *) RATE=40 ;; esac
-            echo "[*] Auto rate: $RATE req/s"
           fi
+          
           ARGS=(-w wordlists/target.txt -l work/subs.txt -t "$THREADS" -r "$RATE" -o filefuzz_out)
           if [ "$EXT_SET" = "custom" ]; then
-            [ -z "$CUSTOM_EXT" ] && { echo "❌ ext_preset=custom requires custom_ext"; exit 1; }
             ARGS+=(--ext "$CUSTOM_EXT")
           else
             ARGS+=(-e "$EXT_SET")
@@ -178,6 +301,7 @@ jobs:
           [ "$FORCE_EXT" = "on" ] && ARGS+=(--force-ext)
           [ -n "$TIME_LIMIT" ]    && ARGS+=(--time "$TIME_LIMIT")
           [ "$TRIAGE"    = "off" ] && ARGS+=(--no-triage)
+
           echo "▶ ./filefuzz.sh ${ARGS[*]}"
           ./filefuzz.sh "${ARGS[@]}"
 
@@ -190,7 +314,6 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      # ---------- Telegram notify (inlined) ----------
       - name: Notify Telegram
         if: always()
         env:
@@ -200,68 +323,25 @@ jobs:
           TARGET_COUNT:       ${{ steps.parse.outputs.count }}
           WL_TIER:            ${{ inputs.wordlist }}
           EXT_SET:            ${{ inputs.ext_preset }}
-          JOB_STATUS:         ${{ job.status }}
         run: |
-          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
-            echo "[!] Telegram secrets not configured — skipping"; exit 0
-          fi
-
-          MSG="$RUNNER_TEMP/tg.txt"
-          total=0; sensitive=0; interesting=0
-          [ -f filefuzz_out/ALL_UNIQUE_FILES.txt ]        && total=$(wc -l < filefuzz_out/ALL_UNIQUE_FILES.txt | tr -d ' ')
-          [ -f filefuzz_out/triage_sensitive.txt ]        && sensitive=$(wc -l < filefuzz_out/triage_sensitive.txt | tr -d ' ')
-          [ -f filefuzz_out/triage_interesting.txt ]      && interesting=$(wc -l < filefuzz_out/triage_interesting.txt | tr -d ' ')
-
-          {
-            echo "📄 FILE FUZZ — ${JOB_STATUS}"
-            echo "Targets: ${TARGET_COUNT}"
-            echo "Wordlist: ${WL_TIER} | Ext: ${EXT_SET}"
-            echo ""
-            echo "📊 Results"
-            echo "• Unique URLs:      ${total}"
-            echo "• 🎯 Sensitive:     ${sensitive}"
-            echo "• 🔎 Interesting:   ${interesting}"
-            echo ""
-
-            if [ "$sensitive" -gt 0 ]; then
-              echo "🎯 Top sensitive (backups/configs/archives):"
-              head -15 filefuzz_out/triage_sensitive.txt | sed 's/^/  /'
-              [ "$sensitive" -gt 15 ] && echo "  ... +$((sensitive - 15)) more"
-              echo ""
-            elif [ "$total" -gt 0 ]; then
-              echo "🎯 Top URLs:"
-              head -15 filefuzz_out/ALL_UNIQUE_FILES.txt | sed 's/^/  /'
-              [ "$total" -gt 15 ] && echo "  ... +$((total - 15)) more"
-              echo ""
-            fi
-
-            echo "🔗 ${RUN_URL}"
-          } > "$MSG"
-
-          if [ "$(wc -c < "$MSG")" -gt 4000 ]; then
-            head -c 3900 "$MSG" > "${MSG}.t"
-            printf '\n\n... [truncated — see artifact]\n' >> "${MSG}.t"
-            mv "${MSG}.t" "$MSG"
-          fi
-
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then exit 0; fi
+          total=0; sensitive=0
+          [ -f filefuzz_out/ALL_UNIQUE_FILES.txt ] && total=$(wc -l < filefuzz_out/ALL_UNIQUE_FILES.txt)
+          [ -f filefuzz_out/triage_sensitive.txt ] && sensitive=$(wc -l < filefuzz_out/triage_sensitive.txt)
+          
+          MSG="📄 FILE FUZZ — ${{ job.status }}%0A• Targets: ${TARGET_COUNT}%0A• Unique URLs: ${total}%0A• Sensitive Files: ${sensitive}%0A🔗 ${RUN_URL}"
           curl -sS -o /dev/null -w '[+] Telegram: HTTP %{http_code}\n' \
             -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text@${MSG}" \
-            -d "disable_web_page_preview=true" \
-            --max-time 30 || echo "[!] Telegram send failed (continuing)"
+            -d "chat_id=${TELEGRAM_CHAT_ID}&text=${MSG}" || true
 
       - name: Summary
         if: always()
-        shell: bash
         run: |
           {
             echo "## File & Extension Fuzz"
             echo "| Targets | ${{ steps.parse.outputs.count }} |"
             echo "| Wordlist | \`${{ inputs.wordlist }}\` |"
             echo "| Ext preset | \`${{ inputs.ext_preset }}\` |"
-            echo "| Force ext | \`${{ inputs.force_ext }}\` |"
-            echo "| Triage | \`${{ inputs.triage }}\` |"
             echo ""
             if [ -f filefuzz_out/triage_sensitive.txt ] && [ -s filefuzz_out/triage_sensitive.txt ]; then
               s=$(wc -l < filefuzz_out/triage_sensitive.txt | tr -d ' ')
@@ -272,10 +352,7 @@ jobs:
               echo "### ✅ Unique URLs ($n)"
               echo '```'; head -30 filefuzz_out/ALL_UNIQUE_FILES.txt; echo '```'
             else
-              echo "### ⚠️ No results"
-              echo '```'
-              ls -la filefuzz_out/ 2>/dev/null || echo "directory does not exist"
-              echo '```'
+              echo "### ⚠️ No results produced."
             fi
           } >> "$GITHUB_STEP_SUMMARY" || true
         continue-on-error: true
