@@ -156,18 +156,18 @@ jobs:
         run: |
           mkdir -p wordlists
           curl -fsSL --max-time 60 https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-5000.txt -o wordlists/subdomains.txt
-          curl -fsSL --max-time 60 https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/dns-Jhaddix.txt -o wordlists/permutations.txt
+          # Permutation words should be a short list (dev, stage, api...). The old 2M-line
+          # dns-Jhaddix list would make gotator generate an unusably huge candidate set.
+          head -n 100 wordlists/subdomains.txt > wordlists/permutations.txt
           wc -l wordlists/subdomains.txt wordlists/permutations.txt
           test -s wordlists/subdomains.txt
           test -s wordlists/permutations.txt
 
-      - name: Initialize resolvers
+      - name: Download resolvers
         run: |
-          export PATH="$PATH:$(go env GOPATH)/bin"
-          if ! puredns init; then
-            echo "puredns init failed — falling back to trickest/resolvers"
-            curl -fsSL --max-time 60 https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt -o resolvers.txt
-          fi
+          # puredns has no "init" command (the old step always failed and fell through to
+          # this download anyway), so fetch the public resolver list directly.
+          curl -fsSL --max-time 60 https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt -o resolvers.txt
           test -s resolvers.txt
           echo "resolvers.txt lines: $(wc -l < resolvers.txt)"
 
@@ -217,88 +217,133 @@ jobs:
             esac
           done
 
-          mkdir -p "$OUTDIR"
+          LOGS="$OUTDIR/logs"          # visible (non-hidden) so it is included in the uploaded artifact
           TMP="$OUTDIR/.tmp"
-          mkdir -p "$TMP"
+          mkdir -p "$OUTDIR" "$LOGS" "$TMP"
+          TARGET_RE="${TARGET//./\\.}"
 
-          dedupe () { if command -v anew >/dev/null 2>&1; then anew "$@"; else sort -u; fi; }
+          count () { if [[ -f "$1" ]]; then wc -l < "$1" | tr -d ' '; else echo 0; fi; }
 
-          # Fix: puredns' actual rate-limit flag is --rate-limit, not -rate.
-          # The old version passed "-rate N", which puredns would reject as an
-          # unknown flag — meaning this retry/backoff logic silently never worked
-          # (the failure was swallowed by the surrounding `|| true` elsewhere).
+          # Fix: the old dedupe() fell back to a bare `sort -u` when `anew` was missing
+          # (it never is installed here). That prints to the console and IGNORES the
+          # output-file argument, so passive_subs.txt / resolved_subs.txt were never
+          # written and every later phase had empty input. This one really writes the file.
+          merge_into () {   # usage: <stdin> | merge_into FILE   (merges with existing FILE, unique)
+            local f="$1" t
+            t=$(mktemp)
+            { [[ -f "$f" ]] && cat "$f"; cat; } | sed '/^$/d' | sort -u > "$t"
+            mv "$t" "$f"
+          }
+
+          # Runs a tool with a timeout, keeps its output in logs/<name>.log (instead of
+          # /dev/null, which hid every error), and reports non-zero exits.
+          run_logged () {
+            local name="$1"; shift
+            timeout "${PHASE_TIMEOUT}s" "$@" > "$LOGS/$name.log" 2>&1
+            local rc=$?
+            if   [[ $rc -eq 124 ]]; then echo "[!] $name timed out after ${PHASE_TIMEOUT}s"
+            elif [[ $rc -ne 0   ]]; then echo "[!] $name exited with $rc (logs/$name.log):"; tail -n 3 "$LOGS/$name.log" | sed 's/^/      /'
+            fi
+            return 0
+          }
+
+          # puredns' flag is --rate-limit (the old code passed -rate). `timeout` cannot run a
+          # bash function, so the timeout lives inside here rather than around the call.
           rate_guard () {
-            local base_rate=$1; shift
-            local rate=$base_rate fails=0
+            local name="$1" rate="$2" fails=0; shift 2
             while true; do
-              "$@" --rate-limit "$rate" 2>&1 | tee "$TMP/rate_guard.log"
-              if grep -qiE '429|403|REFUSED|SERVFAIL' "$TMP/rate_guard.log"; then
+              timeout "${PHASE_TIMEOUT}s" "$@" --rate-limit "$rate" > "$LOGS/$name.log" 2>&1
+              if grep -qiE 'REFUSED|SERVFAIL|too many requests' "$LOGS/$name.log"; then
                 rate=$(( rate / 2 )); (( rate < 1 )) && rate=1
                 fails=$(( fails + 1 ))
-                sleep $(( 15 * fails ))
+                echo "[!] $name: resolver pushback, retrying at ${rate}/s (attempt $fails)"
                 (( fails >= 3 )) && return 1
+                sleep $(( 15 * fails ))
               else
                 break
               fi
             done
+            return 0
           }
 
           echo "[*] Phase 1: Passive enumeration for $TARGET"
-          : > "$TMP/sub_all.txt"
-          command -v subfinder   >/dev/null && timeout "${PHASE_TIMEOUT}s" subfinder -d "$TARGET" -all -silent -o "$TMP/sub_subfinder.txt" 2>/dev/null || true
-          command -v assetfinder >/dev/null && timeout "${PHASE_TIMEOUT}s" assetfinder --subs-only "$TARGET" > "$TMP/sub_assetfinder.txt" 2>/dev/null || true
-          command -v amass       >/dev/null && timeout "${PHASE_TIMEOUT}s" amass enum -passive -d "$TARGET" -o "$TMP/sub_amass.txt" 2>/dev/null || true
+          if command -v subfinder >/dev/null 2>&1; then
+            run_logged subfinder subfinder -d "$TARGET" -all -silent -o "$TMP/sub_subfinder.txt"
+          fi
+          if command -v assetfinder >/dev/null 2>&1; then
+            timeout "${PHASE_TIMEOUT}s" assetfinder --subs-only "$TARGET" > "$TMP/sub_assetfinder.txt" 2> "$LOGS/assetfinder.log" || true
+          fi
+          if command -v amass >/dev/null 2>&1; then
+            run_logged amass amass enum -passive -d "$TARGET" -timeout 5 -o "$TMP/sub_amass.txt"
+          fi
+          curl -s --max-time 60 "https://crt.sh/?q=%25.$TARGET&output=json" -o "$TMP/crt.json" 2> "$LOGS/crtsh.log" || echo "[!] crt.sh request failed (it often rate-limits CI runners)"
+          jq -r '.[].name_value' "$TMP/crt.json" 2>> "$LOGS/crtsh.log" | sed 's/\*\.//g' | tr ',' '\n' | grep -oE "[A-Za-z0-9._-]+\.${TARGET_RE}" | sort -u > "$TMP/sub_crt.txt" || true
 
-          curl -s --max-time 60 "https://crt.sh/?q=%25.$TARGET&output=json" | jq -r '.[].name_value' | sed 's/\*\.//g' | tr ',' '\n' | grep -oE "[A-Za-z0-9._-]+\.${TARGET}" | sort -u > "$TMP/sub_crt.txt" 2>/dev/null || true
-
-          find "$TMP" -maxdepth 1 -name 'sub_*.txt' -exec cat {} + 2>/dev/null | sed '/^$/d' | dedupe "$OUTDIR/passive_subs.txt" || touch "$OUTDIR/passive_subs.txt"
-          echo "[+] Passive: $(wc -l < "$OUTDIR/passive_subs.txt" | tr -d ' ') candidates"
+          : > "$OUTDIR/passive_subs.txt"
+          cat "$TMP"/sub_*.txt 2>/dev/null | tr 'A-Z' 'a-z' | sed 's/\.$//' | grep -E "(^|\.)${TARGET_RE}$" | merge_into "$OUTDIR/passive_subs.txt"
+          echo "[+] Passive: $(count "$OUTDIR/passive_subs.txt") candidates"
+          for f in subfinder assetfinder amass crt; do printf '      %-12s %s\n' "$f" "$(count "$TMP/sub_$f.txt")"; done
 
           cp "$OUTDIR/passive_subs.txt" "$OUTDIR/all_subs_raw.txt"
           if [[ "$MODE" != "passive" ]]; then
             echo "[*] Phase 2: Active bruteforce (puredns)"
-            # Fix: RATE was accepted as an input but never actually applied to the
-            # brute-force call, so the "rate" setting did nothing on the phase that
-            # hits target DNS infra hardest. Now honored via --rate-limit.
-            timeout 600 puredns bruteforce "$WORDLIST" "$TARGET" -r "$RESOLVERS" -t "$THREADS" --rate-limit "$RATE" -o "$TMP/sub_bruteforce.txt" > /dev/null 2>&1 || true
-            find "$OUTDIR/passive_subs.txt" "$TMP/sub_bruteforce.txt" -type f -exec cat {} + 2>/dev/null | sed '/^$/d' | dedupe "$OUTDIR/all_subs_raw.txt" || touch "$OUTDIR/all_subs_raw.txt"
+            # puredns writes results with -w/--write (the old code used -o, which is not a puredns
+            # flag) and has no -t threads flag. RATE is now actually applied here.
+            rate_guard puredns_bruteforce "$RATE" puredns bruteforce "$WORDLIST" "$TARGET" -r "$RESOLVERS" -w "$TMP/sub_bruteforce.txt" || true
+            echo "[+] Bruteforce found: $(count "$TMP/sub_bruteforce.txt")"
+            cat "$OUTDIR/passive_subs.txt" "$TMP/sub_bruteforce.txt" 2>/dev/null | sed '/^$/d' | sort -u > "$OUTDIR/all_subs_raw.txt"
           fi
-          echo "[+] Raw merged: $(wc -l < "$OUTDIR/all_subs_raw.txt" | tr -d ' ') candidates"
+          echo "[+] Raw merged: $(count "$OUTDIR/all_subs_raw.txt") candidates"
 
           echo "[*] Phase 3: Resolve (dnsx)"
-          random_name="nonexistent-$(head -c 200 /dev/urandom | tr -dc a-z | head -c 8).$TARGET"
-          wildcard_ip=$(dig +short "$random_name" A 2>/dev/null | head -n1 || true)
-          if [[ -n "$wildcard_ip" ]]; then
-            timeout "${PHASE_TIMEOUT}s" dnsx -l "$OUTDIR/all_subs_raw.txt" -a -resp -silent -wd "$TARGET" -o "$TMP/resolved.txt" > /dev/null 2>&1 || true
+          : > "$OUTDIR/resolved_subs.txt"
+          if [[ -s "$OUTDIR/all_subs_raw.txt" ]]; then
+            random_name="nonexistent-$(head -c 200 /dev/urandom | tr -dc a-z | head -c 8).$TARGET"
+            wildcard_ip=$(dig +short "$random_name" A 2>/dev/null | head -n1 || true)
+            if [[ -n "$wildcard_ip" ]]; then
+              echo "[!] Wildcard DNS detected for $TARGET — filtering"
+              run_logged dnsx dnsx -l "$OUTDIR/all_subs_raw.txt" -a -resp -silent -wd "$TARGET" -o "$TMP/resolved.txt"
+            else
+              run_logged dnsx dnsx -l "$OUTDIR/all_subs_raw.txt" -a -resp -silent -o "$TMP/resolved.txt"
+            fi
+            [[ -f "$TMP/resolved.txt" ]] && cp "$TMP/resolved.txt" "$OUTDIR/resolved_with_ips.txt"
+            sed -E 's/[[:space:]].*$//' "$TMP/resolved.txt" 2>/dev/null | merge_into "$OUTDIR/resolved_subs.txt"
           else
-            timeout "${PHASE_TIMEOUT}s" dnsx -l "$OUTDIR/all_subs_raw.txt" -a -resp -silent -o "$TMP/resolved.txt" > /dev/null 2>&1 || true
+            echo "[!] No candidates to resolve — skipping"
           fi
-          sed -E 's/[[:space:]].*$//' "$TMP/resolved.txt" 2>/dev/null | sed '/^$/d' | dedupe "$OUTDIR/resolved_subs.txt" || touch "$OUTDIR/resolved_subs.txt"
-          echo "[+] Resolved: $(wc -l < "$OUTDIR/resolved_subs.txt" | tr -d ' ') live subdomains"
+          echo "[+] Resolved: $(count "$OUTDIR/resolved_subs.txt") live subdomains"
 
-          if [[ "$MODE" == "full" && "$RECURSION_DEPTH" -gt 0 ]]; then
+          if [[ "$MODE" == "full" && "$RECURSION_DEPTH" -gt 0 && -s "$OUTDIR/resolved_subs.txt" ]]; then
             echo "[*] Phase 4: Recursion (depth=$RECURSION_DEPTH)"
             if [[ -n "$PERM_WORDLIST" && -r "$PERM_WORDLIST" ]]; then
+              : > "$TMP/permuted_candidates.txt"
               if command -v gotator >/dev/null 2>&1; then
-                timeout "${PHASE_TIMEOUT}s" gotator -sub "$OUTDIR/resolved_subs.txt" -perm "$PERM_WORDLIST" -depth "$RECURSION_DEPTH" -numbers 10 > "$TMP/permuted_candidates.txt" 2>/dev/null || true
+                # Candidate list is capped so permutations cannot explode the run.
+                timeout "${PHASE_TIMEOUT}s" gotator -sub "$OUTDIR/resolved_subs.txt" -perm "$PERM_WORDLIST" -depth "$RECURSION_DEPTH" -numbers 10 -silent 2> "$LOGS/gotator.log" | head -n 1000000 > "$TMP/permuted_candidates.txt"
               elif command -v dnsgen >/dev/null 2>&1; then
                 input="$OUTDIR/resolved_subs.txt"
-                for ((i=1; i<=RECURSION_DEPTH; i++)); do timeout "${PHASE_TIMEOUT}s" dnsgen "$input" > "$TMP/perm_$i.txt" 2>/dev/null || true; input="$TMP/perm_$i.txt"; done
-                cat "$TMP"/perm_*.txt > "$TMP/permuted_candidates.txt" 2>/dev/null || true
+                for ((i=1; i<=RECURSION_DEPTH; i++)); do
+                  timeout "${PHASE_TIMEOUT}s" dnsgen "$input" 2>> "$LOGS/dnsgen.log" | head -n 1000000 > "$TMP/perm_$i.txt"
+                  input="$TMP/perm_$i.txt"
+                done
+                cat "$TMP"/perm_*.txt 2>/dev/null | sort -u > "$TMP/permuted_candidates.txt"
               fi
+              echo "[+] Permutation candidates: $(count "$TMP/permuted_candidates.txt")"
               if [[ -s "$TMP/permuted_candidates.txt" ]]; then
-                timeout "${PHASE_TIMEOUT}s" rate_guard "$RATE" puredns resolve "$TMP/permuted_candidates.txt" -r "$RESOLVERS" -t "$THREADS" -o "$TMP/permuted_resolved.txt" > /dev/null 2>&1 || true
-                if [[ -s "$TMP/permuted_resolved.txt" ]]; then
-                  find "$OUTDIR/resolved_subs.txt" "$TMP/permuted_resolved.txt" -type f -exec cat {} + 2>/dev/null | sed '/^$/d' | dedupe "$TMP/resolved_with_recursion.txt" || true
-                  mv "$TMP/resolved_with_recursion.txt" "$OUTDIR/resolved_subs.txt" 2>/dev/null || true
-                fi
+                rate_guard puredns_permuted "$RATE" puredns resolve "$TMP/permuted_candidates.txt" -r "$RESOLVERS" -w "$TMP/permuted_resolved.txt" || true
+                echo "[+] Permutations that resolved: $(count "$TMP/permuted_resolved.txt")"
+                cat "$TMP/permuted_resolved.txt" 2>/dev/null | merge_into "$OUTDIR/resolved_subs.txt"
               fi
             fi
           fi
 
           echo "[*] Phase 5: HTTP probing (httpx)"
-          timeout "${PHASE_TIMEOUT}s" httpx -l "$OUTDIR/resolved_subs.txt" -ports 80,443,8080,8443 -sc -title -tech-detect -cdn -silent -t "$THREADS" -rl "$RATE" -timeout 10 -o "$OUTDIR/live_hosts.txt" > /dev/null 2>&1 || true
-          echo "[+] Live HTTP hosts: $(wc -l < "$OUTDIR/live_hosts.txt" | tr -d ' ')"
+          : > "$OUTDIR/live_hosts.txt"
+          if [[ -s "$OUTDIR/resolved_subs.txt" ]]; then
+            run_logged httpx httpx -l "$OUTDIR/resolved_subs.txt" -ports 80,443,8080,8443 -sc -title -tech-detect -cdn -silent -t "$THREADS" -rl "$RATE" -timeout 10 -o "$OUTDIR/live_hosts.txt"
+          fi
+          echo "[+] Live HTTP hosts: $(count "$OUTDIR/live_hosts.txt")"
+          echo "[+] Done. Per-tool logs are in $LOGS/"
           SCRIPT_EOF
 
           # 2. Make it executable
