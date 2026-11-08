@@ -45,10 +45,15 @@ on:
         type: string
         default: ''
       per_target_timeout:
-        description: 'Max minutes to spend per target, per tool (default 15)'
+        description: 'Max minutes any single tool run may use on one target (default 15)'
         required: false
         type: string
         default: '15'
+      total_budget_minutes:
+        description: 'Hard cap for ALL targets combined, in minutes (max 105; default 100). Time is split fairly across targets.'
+        required: false
+        type: string
+        default: '100'
 
 concurrency:
   group: dirfuzz-${{ github.run_id }}
@@ -81,6 +86,7 @@ jobs:
           THREADS: ${{ inputs.threads }}
           RATE: ${{ inputs.rate }}
           TIMEOUT_MIN: ${{ inputs.per_target_timeout }}
+          BUDGET_MIN: ${{ inputs.total_budget_minutes }}
           EXCLUDE_CODES: ${{ inputs.exclude_codes }}
         run: |
           set -euo pipefail
@@ -90,6 +96,9 @@ jobs:
           [[ "$RATE"        =~ ^[0-9]+$ ]] || err "rate must be a positive integer"
           [[ "$DEPTH"       =~ ^[0-9]+$ ]] || err "depth must be a non-negative integer (0 = unlimited)"
           [[ "$TIMEOUT_MIN" =~ ^[0-9]+$ ]] || err "per_target_timeout must be a positive integer"
+          [[ "$BUDGET_MIN"  =~ ^[0-9]+$ ]] || err "total_budget_minutes must be a positive integer"
+          # The job limit is 120 min; ~5 min is needed for tool install + upload/notify steps.
+          (( BUDGET_MIN >= 1 && BUDGET_MIN <= 105 )) || err "total_budget_minutes must be between 1 and 105"
 
           if [ -n "$EXCLUDE_CODES" ]; then
             [[ "$EXCLUDE_CODES" =~ ^[0-9]+(,[0-9]+)*$ ]] || err "exclude_codes must be comma-separated numbers, e.g. 403,500"
@@ -203,6 +212,7 @@ jobs:
           RECURSION:     ${{ inputs.recursion }}
           EXCLUDE_CODES: ${{ inputs.exclude_codes }}
           TIMEOUT_MIN:   ${{ inputs.per_target_timeout }}
+          BUDGET_MIN:    ${{ inputs.total_budget_minutes }}
         run: |
           # 1. Write the bash script to a file on the runner
           cat > fuzzall.sh << 'SCRIPT_EOF'
@@ -216,8 +226,9 @@ jobs:
           OUTDIR="./fuzz_out"
           FEROX_RECURSION=1
           FEROX_DEPTH=""
-          TARGET_TIMEOUT=900
+          TARGET_TIMEOUT=900     # max seconds any single tool run may use
           EXCLUDE_CODES=""
+          BUDGET=6000            # total seconds for ALL targets; the script finishes inside this
 
           while [[ $# -gt 0 ]]; do
             case "$1" in
@@ -229,18 +240,19 @@ jobs:
               -d) FEROX_DEPTH="$2"; shift 2 ;;
               -T) TARGET_TIMEOUT="$2"; shift 2 ;;
               -x) EXCLUDE_CODES="$2"; shift 2 ;;
+              -B) BUDGET="$2"; shift 2 ;;
               --no-recursion) FEROX_RECURSION=0; shift ;;
               *) shift ;;
             esac
           done
 
-          mkdir -p "$OUTDIR"
+          LOGS="$OUTDIR/logs"       # visible folder so tool logs are included in the artifact
           TMP="$OUTDIR/.tmp"
-          mkdir -p "$TMP"
+          REPORT="$OUTDIR/run_report.txt"
+          mkdir -p "$OUTDIR" "$LOGS" "$TMP"
+          : > "$REPORT"
+          say () { echo "$*" | tee -a "$REPORT"; }
 
-          # Fix: the old version only added https:// when a line had NO ':' or
-          # '/' anywhere, so "host:8080" or "host/path" were left schemeless and
-          # broke every downstream tool. Now it only checks the actual prefix.
           clean_subs () {
             tr -d '\r' < "$1" \
               | sed -E 's/#.*$//; s/^[[:space:]]+//; s/[[:space:]]+$//' \
@@ -269,36 +281,84 @@ jobs:
 
           CLEANED="$OUTDIR/subs.cleaned.txt"
           clean_subs "$SUBS_FILE" > "$CLEANED"
+          N=$(wc -l < "$CLEANED" | tr -d ' ')
+          WL_LINES=$(wc -l < "$WORDLIST" | tr -d ' ')
+          START=$(date +%s)
+          DEADLINE=$(( START + BUDGET ))
 
+          # Fix: the old script gave every tool run its own fixed timeout, so total time was
+          # targets x 2 x timeout with no overall cap — the job simply hit the 2h limit and was
+          # cancelled. Now the remaining budget is divided across the tool runs still to do.
+          slice_secs () {   # $1 = number of tool runs still to do, including the one about to start
+            local left=$(( DEADLINE - $(date +%s) )) runs=$1 s
+            (( runs < 1 )) && runs=1
+            s=$(( left / runs ))
+            (( s > TARGET_TIMEOUT )) && s=$TARGET_TIMEOUT
+            (( s < 0 )) && s=0
+            echo "$s"
+          }
+
+          first=$(slice_secs $(( N * 2 )))
+          say "[plan] $N target(s) x 2 tools | wordlist $WL_LINES entries | rate $RATE req/s | budget $(( BUDGET / 60 )) min"
+          if (( RATE > 0 && WL_LINES > 0 )); then
+            need=$(( WL_LINES / RATE ))
+            cov=$(( first * RATE * 100 / WL_LINES )); (( cov > 100 )) && cov=100
+            say "[plan] one full wordlist pass takes ~$(( need / 60 )) min per tool per target; each tool gets ~$(( first / 60 )) min => ~${cov}% of the wordlist"
+            if (( cov < 100 )); then
+              say "[plan] NOTE: coverage is under 100% — raise rate, use a smaller wordlist tier, scan fewer targets per run, or raise the budget."
+            fi
+          fi
+
+          i=0
           while IFS= read -r entry; do
             [[ -z "$entry" ]] && continue
+            i=$(( i + 1 ))
             url="$entry"
+
+            if (( DEADLINE - $(date +%s) < 20 )); then
+              say "[!] ($i/$N) budget exhausted — SKIPPED: $url"
+              continue
+            fi
+
             hash=$(printf '%s' "$url" | sha1sum | cut -c1-8)
             safe="$(printf '%s' "$url" | sed -E 's#https?://##; s#[^A-Za-z0-9]+#_#g; s#_+$##')_${hash}"
             base="$OUTDIR/$safe"
+            runs_left=$(( (N - i + 1) * 2 ))
 
-            echo "[*] target: $url (timeout ${TARGET_TIMEOUT}s per tool)"
-
-            ferox_args=(-u "$url" -w "$WORDLIST" -t "$THREADS" --rate-limit "$RATE" --scan-limit 2 --auto-tune --auto-bail --timeout 10 --json -o "${base}.ferox.jsonl" -q)
+            # ---- feroxbuster ----
+            s1=$(slice_secs "$runs_left")
+            say "[*] ($i/$N) $url — feroxbuster for up to ${s1}s"
+            # --time-limit makes feroxbuster stop gracefully (results are streamed to the .jsonl
+            # as found, so nothing is lost); the outer timeout is only a backstop.
+            ferox_args=(-u "$url" -w "$WORDLIST" -t "$THREADS" --rate-limit "$RATE" --scan-limit 2 --auto-tune --auto-bail --timeout 10 --time-limit "${s1}s" --no-state --json -o "${base}.ferox.jsonl" -q)
             [[ "$FEROX_RECURSION" -eq 0 ]] && ferox_args+=( --no-recursion )
-            # Always pass -d explicitly when recursion is on — feroxbuster treats
-            # depth=0 as "unlimited", but the old script *omitted* -d for depth=0,
-            # which silently fell back to feroxbuster's own default depth instead.
+            # Always pass --depth when recursion is on (feroxbuster treats 0 as unlimited).
             [[ "$FEROX_RECURSION" -eq 1 ]] && ferox_args+=( --depth "$FEROX_DEPTH" )
+            timeout -k 15s "$(( s1 + 30 ))s" feroxbuster "${ferox_args[@]}" > "$LOGS/${safe}.ferox.log" 2>&1
+            rc=$?
+            (( rc == 124 || rc == 137 )) && say "    [!] feroxbuster had to be force-stopped"
 
-            timeout "${TARGET_TIMEOUT}s" feroxbuster "${ferox_args[@]}" >/dev/null 2>&1 || true
-
-            timeout "${TARGET_TIMEOUT}s" ffuf -w "$WORDLIST" -u "${url%/}/FUZZ" -t "$THREADS" -rate "$RATE" -timeout 10 -ac -of json -o "${base}.ffuf.json" -s >/dev/null 2>&1 || true
+            # ---- ffuf ----
+            s2=$(slice_secs $(( runs_left - 1 )))
+            if (( s2 >= 5 )); then
+              say "    ffuf for up to ${s2}s"
+              # -maxtime makes ffuf stop cleanly AND write its JSON; ffuf writes output only on a
+              # clean exit, so a hard kill would lose everything. SIGINT backstop does the same.
+              timeout -s INT -k 15s "$(( s2 + 30 ))s" ffuf -w "$WORDLIST" -u "${url%/}/FUZZ" -t "$THREADS" -rate "$RATE" -timeout 10 -maxtime "$s2" -ac -of json -o "${base}.ffuf.json" -s > "$LOGS/${safe}.ffuf.log" 2>&1
+            else
+              say "    [!] not enough budget left for ffuf on this target"
+            fi
 
             jq -r 'select(.type=="response") | [.url, (.status|tostring)] | @tsv' "${base}.ferox.jsonl" 2>/dev/null > "${TMP}/${safe}.ferox.tsv" || true
             jq -r '.results[]? | [.url, (.status|tostring)] | @tsv' "${base}.ffuf.json" 2>/dev/null > "${TMP}/${safe}.ffuf.tsv" || true
 
             cat "${TMP}/${safe}.ferox.tsv" "${TMP}/${safe}.ffuf.tsv" 2>/dev/null | sed '/^[[:space:]]*$/d' | filter_codes | dedupe > "${base}.urls.txt"
+            say "    -> $(wc -l < "${base}.urls.txt" | tr -d ' ') URLs  (ferox $(wc -l < "${TMP}/${safe}.ferox.tsv" | tr -d ' ') / ffuf $(wc -l < "${TMP}/${safe}.ffuf.tsv" | tr -d ' '))"
           done < "$CLEANED"
 
           MASTER="$OUTDIR/ALL_UNIQUE_URLS.txt"
           cat "$OUTDIR"/*.urls.txt 2>/dev/null | sed '/^[[:space:]]*$/d' | dedupe > "$MASTER"
-          echo "[+] Master file: $MASTER"
+          say "[+] Master file: $MASTER ($(wc -l < "$MASTER" | tr -d ' ') URLs) — finished in $(( ($(date +%s) - START) / 60 )) min"
           SCRIPT_EOF
 
           # 2. Make it executable
@@ -306,7 +366,7 @@ jobs:
 
           # 3. Run it
           TARGET_TIMEOUT_SECONDS=$(( TIMEOUT_MIN * 60 ))
-          ARGS=(-w wordlists/target.txt -l work/subs.txt -t "$THREADS" -R "$RATE" -o fuzz_out -T "$TARGET_TIMEOUT_SECONDS" -x "$EXCLUDE_CODES")
+          ARGS=(-w wordlists/target.txt -l work/subs.txt -t "$THREADS" -R "$RATE" -o fuzz_out -T "$TARGET_TIMEOUT_SECONDS" -x "$EXCLUDE_CODES" -B "$(( BUDGET_MIN * 60 ))")
           if [ "$RECURSION" = "off" ]; then
             ARGS+=(--no-recursion)
           else
@@ -363,6 +423,10 @@ jobs:
             echo "| Recursion | \`$RECURSION\` |"
             echo "| Depth | \`$DEPTH\` |"
             echo ""
+            if [ -f fuzz_out/run_report.txt ]; then
+              echo "### Run report"
+              echo '```'; cat fuzz_out/run_report.txt; echo '```'
+            fi
             if [ -f fuzz_out/ALL_UNIQUE_URLS.txt ]; then
               n=$(wc -l < fuzz_out/ALL_UNIQUE_URLS.txt | tr -d ' ')
               echo "### ✅ Unique URLs: $n"
