@@ -110,7 +110,9 @@ jobs:
           cd /tmp/massdns
           make -j
           sudo make install
-          massdns --version
+          # massdns has no --version flag (it treats it as a domain file and exits 1),
+          # so just confirm the binary is installed and on PATH.
+          command -v massdns && echo "massdns OK"
 
       - name: Install Go tools
         run: |
