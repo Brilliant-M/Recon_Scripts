@@ -13,8 +13,8 @@ on:
         type: choice
         default: 'active'
         options:
-          - passive
-          - active
+          - passive    # subfinder + historical URLs only, no crawling
+          - active     # subfinder + httpx + katana crawl + historical URLs
       threads:
         description: 'Concurrency for httpx/katana (default 10)'
         required: false
@@ -51,10 +51,12 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
-          cache: true
+          go-version: '1.23'  # FIXED: Updated to latest stable Go
+          cache: false
 
       - name: Install Go tools
+        env:
+          GOTOOLCHAIN: local  # FIXED: Prevents downloading non-existent Go 1.26
         run: |
           export PATH="$PATH:$(go env GOPATH)/bin"
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
@@ -97,7 +99,7 @@ jobs:
           if curl -fsSL "$primary" -o wordlists/xss.txt 2>/dev/null; then
             echo "[+] Downloaded primary XSS wordlist (robot-friendly)"
           elif curl -fsSL "$fallback" -o wordlists/xss.txt 2>/dev/null; then
-            echo "[!] Primary failed — using fallback wordlist"
+            echo "[!] Primary failed (404/moved) — using fallback wordlist"
           else
             echo "❌ Both XSS wordlist sources failed"
             exit 1
@@ -107,6 +109,7 @@ jobs:
           test -s wordlists/xss.txt
           head -3 wordlists/xss.txt
 
+      # ---------- PHASE 1 ----------
       - name: Enumerate subdomains
         env:
           TARGET: ${{ inputs.target }}
@@ -128,6 +131,7 @@ jobs:
           echo "[+] Subdomains: $n"
           test "$n" -gt 0 || { echo "❌ No subdomains found"; exit 1; }
 
+      # ---------- PHASE 2 (with WORKING_SUBS output) ----------
       - name: Probe live hosts
         env:
           THREADS: ${{ inputs.threads }}
@@ -149,6 +153,7 @@ jobs:
           echo "--- preview ---"
           head -5 work/WORKING_SUBS.txt
 
+      # ---------- PHASE 3 ----------
       - name: Collect URLs (katana + gau + waybackurls)
         env:
           TARGET: ${{ inputs.target }}
@@ -180,6 +185,7 @@ jobs:
             | sed '/^$/d' | uro | sort -u > work/all_urls.txt || true
           echo "[+] Merged unique URLs: $(wc -l < work/all_urls.txt | tr -d ' ')"
 
+      # ---------- PHASE 4 ----------
       - name: Filter XSS and redirect candidates
         run: |
           set -euo pipefail
@@ -217,6 +223,7 @@ jobs:
           echo "--- Redirect candidates (first 5) ---"
           head -5 work/redirect_candidates.txt || true
 
+      # ---------- PHASE 5 ----------
       - name: Run Dalfox XSS scan
         if: ${{ hashFiles('work/xss_candidates.txt') != '' }}
         env:
@@ -250,6 +257,7 @@ jobs:
             echo "[+] CONFIRMED_XSS.txt: $(wc -l < work/CONFIRMED_XSS.txt 2>/dev/null | tr -d ' ') PoCs"
           fi
 
+      # ---------- PHASE 6 ----------
       - name: Test open redirects
         if: ${{ hashFiles('work/redirect_candidates.txt') != '' }}
         env:
@@ -272,6 +280,7 @@ jobs:
           n=$(wc -l < work/redirect_findings.txt 2>/dev/null | tr -d ' ')
           echo "[+] Open redirect findings: $n"
 
+      # ---------- PHASE 7 ----------
       - name: Merge and dedupe findings
         run: |
           set -euo pipefail
@@ -305,6 +314,7 @@ jobs:
             fi
           done
 
+      # ---------- outputs ----------
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -316,6 +326,7 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
+      # ---------- Telegram ----------
       - name: Notify Telegram
         if: always()
         env:
@@ -333,8 +344,9 @@ jobs:
 
           MSG="$RUNNER_TEMP/tg.txt"
 
-          subs=0; work_subs=0; param_urls=0; xss=0; redir=0
+          subs=0; live=0; work_subs=0; param_urls=0; xss=0; redir=0
           [ -f work/subs.txt ]                           && subs=$(wc -l < work/subs.txt | tr -d ' ')
+          [ -f work/live_hosts.txt ]                     && live=$(wc -l < work/live_hosts.txt | tr -d ' ')
           [ -f work/WORKING_SUBS.txt ]                   && work_subs=$(wc -l < work/WORKING_SUBS.txt | tr -d ' ')
           [ -f work/PARAMETERS_WITH_XSS_POTENTIAL.txt ]  && param_urls=$(wc -l < work/PARAMETERS_WITH_XSS_POTENTIAL.txt | tr -d ' ')
           [ -f work/CONFIRMED_XSS.txt ]                  && xss=$(wc -l < work/CONFIRMED_XSS.txt | tr -d ' ')
@@ -368,11 +380,11 @@ jobs:
             fi
 
             echo "📁 Files in artifact:"
-            echo "  • WORKING_SUBS.txt               (live hosts, clean URLs)"
-            echo "  • PARAMETERS_WITH_XSS_POTENTIAL.txt (URL | params)"
-            echo "  • PARAM_NAMES.txt               (ranked param names)"
-            echo "  • CONFIRMED_XSS.txt             (URL | param | payload)"
-            echo "  • ALL_FINDINGS.txt              (merged view)"
+            echo "  • WORKING_SUBS.txt"
+            echo "  • PARAMETERS_WITH_XSS_POTENTIAL.txt"
+            echo "  • PARAM_NAMES.txt"
+            echo "  • CONFIRMED_XSS.txt"
+            echo "  • ALL_FINDINGS.txt"
             echo ""
             echo "🔗 ${RUN_URL}"
           } > "$MSG"
@@ -390,6 +402,7 @@ jobs:
             -d "disable_web_page_preview=true" \
             --max-time 30 || echo "[!] Telegram send failed (continuing)"
 
+      # ---------- GitHub summary ----------
       - name: Write summary
         if: always()
         shell: bash
